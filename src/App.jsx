@@ -32,6 +32,9 @@ const MAX_ACTIVE_USERS = 150;
 const MAX_TOTAL_USERS = 500;
 const ACTIVE_WINDOW_MS = 2 * 60 * 1000;
 const MOBILE_BREAKPOINT = 860;
+const MAX_UPLOAD_BYTES = 7 * 1024 * 1024;
+const MESSAGE_RATE_LIMIT = 3;
+const MESSAGE_RATE_WINDOW_MS = 1000;
 
 function formatTime(value) {
   if (!value) return "";
@@ -89,8 +92,15 @@ async function uploadMediaToCloudinary(file) {
   if (!cloudName || !uploadPreset) {
     throw new Error("Cloudinary is not configured. Add VITE_CLOUDINARY_CLOUD_NAME and VITE_CLOUDINARY_UPLOAD_PRESET.");
   }
+  if (file.size > MAX_UPLOAD_BYTES) {
+    throw new Error("File size exceeds 7MB limit.");
+  }
 
-  const endpoint = `https://api.cloudinary.com/v1_1/${cloudName}/auto/upload`;
+  let resourceType = "raw";
+  if (file?.type?.startsWith("image/")) resourceType = "image";
+  if (file?.type?.startsWith("video/")) resourceType = "video";
+
+  const endpoint = `https://api.cloudinary.com/v1_1/${cloudName}/${resourceType}/upload`;
   const formData = new FormData();
   formData.append("file", file);
   formData.append("upload_preset", uploadPreset);
@@ -115,6 +125,9 @@ async function uploadAvatarToCloudinary(file, userId) {
 
   if (!cloudName || !uploadPreset) {
     throw new Error("Cloudinary is not configured. Add VITE_CLOUDINARY_CLOUD_NAME and VITE_CLOUDINARY_UPLOAD_PRESET.");
+  }
+  if (file.size > MAX_UPLOAD_BYTES) {
+    throw new Error("Profile image size exceeds 7MB limit.");
   }
 
   const endpoint = `https://api.cloudinary.com/v1_1/${cloudName}/image/upload`;
@@ -142,6 +155,9 @@ async function uploadGroupImageToCloudinary(file, userId) {
 
   if (!cloudName || !uploadPreset) {
     throw new Error("Cloudinary is not configured. Add VITE_CLOUDINARY_CLOUD_NAME and VITE_CLOUDINARY_UPLOAD_PRESET.");
+  }
+  if (file.size > MAX_UPLOAD_BYTES) {
+    throw new Error("Group photo size exceeds 7MB limit.");
   }
 
   const endpoint = `https://api.cloudinary.com/v1_1/${cloudName}/image/upload`;
@@ -225,6 +241,8 @@ export default function App() {
   const [groupPhotoFile, setGroupPhotoFile] = useState(null);
   const [groupStatus, setGroupStatus] = useState("");
   const [savedStatus, setSavedStatus] = useState("");
+  const [composerStatus, setComposerStatus] = useState("");
+  const [showSpamWarning, setShowSpamWarning] = useState(false);
   const [isMobileLayout, setIsMobileLayout] = useState(() => {
     if (typeof window === "undefined") return false;
     return window.innerWidth <= MOBILE_BREAKPOINT;
@@ -244,6 +262,7 @@ export default function App() {
   const firedEventKeysRef = useRef(new Set());
   const eventProcessingRef = useRef(new Set());
   const presenceHeartbeatRef = useRef(null);
+  const messageSendTimesRef = useRef([]);
 
   const usersById = useMemo(() => {
     const map = new Map();
@@ -286,6 +305,34 @@ export default function App() {
 
   function buildSavedId(chatId, messageId) {
     return `${chatId}_${messageId}`;
+  }
+
+  function handleComposerFileSelect(file) {
+    if (!file) {
+      setMediaFile(null);
+      setComposerStatus("");
+      return;
+    }
+    if ((file.size || 0) > MAX_UPLOAD_BYTES) {
+      setMediaFile(null);
+      setComposerStatus("Upload blocked: file must be 7MB or smaller.");
+      return;
+    }
+    setMediaFile(file);
+    setComposerStatus("");
+  }
+
+  function checkMessageRateLimit() {
+    const now = Date.now();
+    const recent = messageSendTimesRef.current.filter((value) => now - value < MESSAGE_RATE_WINDOW_MS);
+    if (recent.length >= MESSAGE_RATE_LIMIT) {
+      messageSendTimesRef.current = recent;
+      setShowSpamWarning(true);
+      return false;
+    }
+    recent.push(now);
+    messageSendTimesRef.current = recent;
+    return true;
   }
 
   function openChat(chatId) {
@@ -549,7 +596,7 @@ export default function App() {
   async function publishTypingState(nextText, chatId = selectedChatId) {
     if (!currentUser || !chatId) return;
     const value = nextText ?? "";
-    if (!value) {
+    if (!value.trim()) {
       await clearTypingState(chatId);
       return;
     }
@@ -560,7 +607,7 @@ export default function App() {
         uid: currentUser.uid,
         username,
         photoURL: userProfile?.photoURL || currentUser.photoURL || "",
-        text: value,
+        isTyping: true,
         updatedAt: serverTimestamp(),
       },
       { merge: true },
@@ -576,7 +623,7 @@ export default function App() {
     const typingUnsub = onSnapshot(collection(db, "chats", selectedChatId, "typing"), (snapshot) => {
       const list = snapshot.docs
         .map((d) => ({ id: d.id, ...d.data() }))
-        .filter((entry) => entry.id !== currentUser.uid && entry.text);
+        .filter((entry) => entry.id !== currentUser.uid && entry.isTyping);
       setTypingStreams(list);
     });
 
@@ -908,9 +955,16 @@ export default function App() {
   async function sendMessage(event) {
     event.preventDefault();
     if (!selectedChat || !currentUser || (!text.trim() && !mediaFile) || sending) return;
+    if (mediaFile && mediaFile.size > MAX_UPLOAD_BYTES) {
+      setMediaFile(null);
+      setComposerStatus("Upload blocked: file must be 7MB or smaller.");
+      return;
+    }
+    if (!checkMessageRateLimit()) return;
 
     setSending(true);
     try {
+      setComposerStatus("");
       setBusyLabel("Sending message...");
       let mediaURL = "";
       let mediaType = "";
@@ -1032,6 +1086,11 @@ export default function App() {
     setProfileStatus("");
 
     const file = event.target.files[0];
+    if ((file.size || 0) > MAX_UPLOAD_BYTES) {
+      setProfileStatus("Profile image must be 7MB or smaller.");
+      event.target.value = "";
+      return;
+    }
     try {
       setBusyLabel("Uploading photo...");
       const url = await uploadAvatarToCloudinary(file, currentUser.uid);
@@ -1175,6 +1234,10 @@ export default function App() {
     }
     if (selectedGroupMemberIds.length === 0) {
       setGroupStatus("Select at least one friend.");
+      return;
+    }
+    if (groupPhotoFile && (groupPhotoFile.size || 0) > MAX_UPLOAD_BYTES) {
+      setGroupStatus("Group photo must be 7MB or smaller.");
       return;
     }
 
@@ -1630,14 +1693,14 @@ export default function App() {
                     type="file"
                     ref={mediaInputRef}
                     accept="image/*,video/*,audio/*"
-                    onChange={(event) => setMediaFile(event.target.files?.[0] || null)}
+                    onChange={(event) => handleComposerFileSelect(event.target.files?.[0] || null)}
                     hidden
                   />
                   <input
                     type="file"
                     ref={documentInputRef}
                     accept=".pdf,.doc,.docx,.txt,.rtf,.xls,.xlsx,.ppt,.pptx,.zip,.rar,.csv"
-                    onChange={(event) => setMediaFile(event.target.files?.[0] || null)}
+                    onChange={(event) => handleComposerFileSelect(event.target.files?.[0] || null)}
                     hidden
                   />
                 </div>
@@ -1647,7 +1710,7 @@ export default function App() {
                     mediaFile
                       ? `Add a caption for ${mediaFile.name}`
                       : activeTypingStream
-                        ? `${activeTypingStream.username || "User"}: ${activeTypingStream.text}`
+                        ? `${activeTypingStream.username || "Someone"} is typing...`
                         : "Type a message..."
                   }
                   value={text}
@@ -1672,16 +1735,24 @@ export default function App() {
                 <div className="thoughtStreamBar">
                   {typingStreams.map((stream) => (
                     <p key={stream.id}>
-                      <strong>{stream.username || "User"}:</strong> {stream.text}
+                      <strong>{stream.username || "Someone"}</strong> is typing...
                     </p>
                   ))}
                 </div>
               )}
+              {composerStatus && <div className="thoughtStreamBar"><p>{composerStatus}</p></div>}
               {savedStatus && <div className="thoughtStreamBar"><p>{savedStatus}</p></div>}
               {mediaFile && (
                 <div className="mediaQueued">
                   <span>{mediaFile.name}</span>
-                  <button type="button" className="ghost" onClick={() => setMediaFile(null)}>
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={() => {
+                      setMediaFile(null);
+                      setComposerStatus("");
+                    }}
+                  >
                     Remove
                   </button>
                 </div>
@@ -1777,7 +1848,16 @@ export default function App() {
                     <input
                       type="file"
                       accept="image/*"
-                      onChange={(event) => setGroupPhotoFile(event.target.files?.[0] || null)}
+                      onChange={(event) => {
+                        const file = event.target.files?.[0] || null;
+                        if (file && (file.size || 0) > MAX_UPLOAD_BYTES) {
+                          setGroupPhotoFile(null);
+                          setGroupStatus("Group photo must be 7MB or smaller.");
+                          event.target.value = "";
+                          return;
+                        }
+                        setGroupPhotoFile(file);
+                      }}
                     />
                   </label>
                   {groupPhotoFile && <small className="muted">Selected: {groupPhotoFile.name}</small>}
@@ -1983,6 +2063,20 @@ export default function App() {
             <div className="loaderDot" />
             <p>{busyLabel}</p>
           </div>
+        </div>
+      )}
+
+      {showSpamWarning && (
+        <div className="popupBackdrop" onClick={() => setShowSpamWarning(false)}>
+          <section className="popupCard" onClick={(event) => event.stopPropagation()}>
+            <div className="popupHead">
+              <h3>Slow down</h3>
+              <button type="button" className="ghost" onClick={() => setShowSpamWarning(false)}>
+                Close
+              </button>
+            </div>
+            <p className="muted">Spam protection: you can send up to 3 messages per second.</p>
+          </section>
         </div>
       )}
 
