@@ -335,6 +335,7 @@ export default function App() {
     return window.innerWidth <= MOBILE_BREAKPOINT;
   });
   const [mobileScreen, setMobileScreen] = useState("list");
+  const [mobileSubgroupsOpen, setMobileSubgroupsOpen] = useState(false);
   const [notificationPermission, setNotificationPermission] = useState(() => {
     if (typeof Notification === "undefined") return "unsupported";
     return Notification.permission;
@@ -495,6 +496,7 @@ export default function App() {
   function openChat(chatId) {
     setSelectedChatId(chatId);
     if (isMobileLayout) setMobileScreen("chat");
+    setMobileSubgroupsOpen(false);
   }
 
   function openAddFriendPopup() {
@@ -860,6 +862,12 @@ export default function App() {
   useEffect(() => {
     if (!isMobileLayout) return;
     if (!selectedChatId) setMobileScreen("list");
+  }, [isMobileLayout, selectedChatId]);
+
+  useEffect(() => {
+    if (!isMobileLayout) {
+      setMobileSubgroupsOpen(false);
+    }
   }, [isMobileLayout, selectedChatId]);
 
   useEffect(() => {
@@ -2001,6 +2009,11 @@ export default function App() {
                 Create Group
               </button>
             )}
+            {isMobileLayout && (
+              <button type="button" className="ghost" onClick={openProfilePopup}>
+                Profile
+              </button>
+            )}
           </div>
         </div>
 
@@ -2082,6 +2095,15 @@ export default function App() {
             <button type="button" onClick={openProfilePopup}>
               Profile
             </button>
+            {isMobileLayout && selectedChat?.isGroup && (
+              <button
+                type="button"
+                className="ghost mobileSubgroupToggle"
+                onClick={() => setMobileSubgroupsOpen((prev) => !prev)}
+              >
+                {mobileSubgroupsOpen ? "→" : "←"}
+              </button>
+            )}
           </div>
         </header>
 
@@ -2361,8 +2383,16 @@ export default function App() {
             </div>
           )}
         </section>
-        {selectedChat?.isGroup && (
-          <aside className="subgroupRail">
+        {isMobileLayout && selectedChat?.isGroup && mobileSubgroupsOpen && (
+          <button
+            type="button"
+            className="subgroupBackdrop"
+            onClick={() => setMobileSubgroupsOpen(false)}
+            aria-label="Close subgroup panel"
+          />
+        )}
+        {selectedChat?.isGroup && (!isMobileLayout || mobileSubgroupsOpen) && (
+          <aside className={`subgroupRail ${isMobileLayout ? "mobileOpen" : ""}`}>
             <div className="subgroupRailHead">
               <h3>Subgroups</h3>
               <small>{activeGroupRoot?.groupName || selectedChat.groupName || "Group"}</small>

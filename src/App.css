@@ -462,6 +462,7 @@ input::placeholder {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: 0.75rem;
+  position: relative;
 }
 
 .panelBody.withSubgroups {
@@ -560,6 +561,22 @@ input::placeholder {
   display: grid;
   grid-template-rows: auto 1fr;
   overflow: hidden;
+}
+
+.subgroupBackdrop {
+  position: absolute;
+  inset: 0;
+  border: none;
+  background: rgba(0, 0, 0, 0.38);
+  z-index: 11;
+  padding: 0;
+}
+
+.mobileSubgroupToggle {
+  min-width: 40px;
+  min-height: 40px;
+  font-size: 1.1rem;
+  padding: 0.35rem;
 }
 
 .subgroupRailHead {
@@ -1525,8 +1542,18 @@ input::placeholder {
     grid-template-columns: 1fr;
   }
 
-  .subgroupRail {
-    display: none;
+  .panelBody.withSubgroups {
+    grid-template-columns: 1fr;
+  }
+
+  .subgroupRail.mobileOpen {
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: min(300px, 88vw);
+    height: 100%;
+    z-index: 12;
+    box-shadow: -14px 0 28px rgba(0, 0, 0, 0.45);
   }
 
   .appShell.mobileLayout {
