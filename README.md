@@ -18,9 +18,51 @@ npm install
 
 2. Update values inside `.env`:
 - Firebase credentials (`VITE_FIREBASE_*`)
+- Firebase Web Push key:
+  - `VITE_FIREBASE_VAPID_KEY`
 - Cloudinary values for chat media:
   - `VITE_CLOUDINARY_CLOUD_NAME`
   - `VITE_CLOUDINARY_UPLOAD_PRESET` (unsigned preset)
+
+For background notifications when the app is closed, also deploy a server-side sender (for example Firebase Cloud Functions) that sends FCM notifications to the stored `users/{uid}.fcmTokens`.
+
+## Backend Push Sender (Cloud Functions)
+
+This repo now includes a Firebase Cloud Function:
+- Trigger: `chats/{chatId}/messages/{messageId}` document create
+- Function: `sendPushOnNewMessage`
+- Behavior: sends FCM web push notifications to chat recipients using tokens stored in `users/{uid}.fcmTokens`
+
+### Deploy steps
+
+1. Install Firebase CLI (if not installed):
+
+```bash
+npm install -g firebase-tools
+```
+
+2. Login and confirm project:
+
+```bash
+firebase login
+firebase use textinger-daf47
+```
+
+3. Install function dependencies:
+
+```bash
+cd functions
+npm install
+cd ..
+```
+
+4. Deploy the function:
+
+```bash
+firebase deploy --only functions
+```
+
+After deploy, new messages will trigger push notifications (including when app is closed), as long as recipient users have valid `fcmTokens`.
 
 3. Start development server:
 

@@ -3,12 +3,15 @@ import {
   createUserWithEmailAndPassword,
   deleteUser,
   onAuthStateChanged,
+  sendEmailVerification,
+  sendPasswordResetEmail,
   signInWithEmailAndPassword,
   signOut,
   updateProfile,
 } from "firebase/auth";
 import {
   addDoc,
+  arrayUnion,
   collection,
   deleteDoc,
   doc,
@@ -26,7 +29,8 @@ import {
   updateDoc,
   where,
 } from "firebase/firestore";
-import { auth, db } from "./firebase";
+import { getToken, onMessage } from "firebase/messaging";
+import { auth, db, getFirebaseMessaging } from "./firebase";
 
 const MAX_ACTIVE_USERS = 150;
 const MAX_TOTAL_USERS = 500;
@@ -35,6 +39,8 @@ const MOBILE_BREAKPOINT = 860;
 const MAX_UPLOAD_BYTES = 7 * 1024 * 1024;
 const MESSAGE_RATE_LIMIT = 3;
 const MESSAGE_RATE_WINDOW_MS = 1000;
+const CHAT_PREVIEW_MAX_LENGTH = 72;
+const GROUP_ROLES = ["member", "editor", "admin", "owner"];
 
 function formatTime(value) {
   if (!value) return "";
@@ -48,6 +54,69 @@ function formatTime(value) {
 
 function buildChatId(uidA, uidB) {
   return [uidA, uidB].sort().join("_");
+}
+
+function truncateText(value, maxLength = CHAT_PREVIEW_MAX_LENGTH) {
+  const text = `${value || ""}`.trim();
+  if (!text) return "";
+  return text.length > maxLength ? `${text.slice(0, Math.max(0, maxLength - 3))}...` : text;
+}
+
+function getGroupRole(chat, uid) {
+  if (!chat?.isGroup || !uid) return "member";
+  if (chat.createdBy === uid) return "creator";
+  const role = chat.groupRoles?.[uid];
+  return GROUP_ROLES.includes(role) ? role : "member";
+}
+
+function canManageGroupCore(chat, uid) {
+  if (!chat?.isGroup || !uid) return false;
+  const role = getGroupRole(chat, uid);
+  return role === "creator" || role === "owner";
+}
+
+function canManageGroupSubgroups(chat, uid) {
+  if (!chat?.isGroup || !uid) return false;
+  const role = getGroupRole(chat, uid);
+  return role === "creator" || role === "owner" || role === "admin";
+}
+
+function canDeleteGroupMessage(chat, message, uid) {
+  if (!uid || !message) return false;
+  if (message.senderId === uid) return true;
+  if (!chat?.isGroup) return false;
+  const role = getGroupRole(chat, uid);
+  return role === "creator" || role === "owner" || role === "editor";
+}
+
+function roleLabel(role) {
+  if (role === "creator") return "Creator";
+  return role.charAt(0).toUpperCase() + role.slice(1);
+}
+
+function normalizeAuthError(error) {
+  const code = error?.code || "";
+  if (
+    code === "auth/invalid-credential" ||
+    code === "auth/user-not-found" ||
+    code === "auth/wrong-password"
+  ) {
+    return "Invalid credentials.";
+  }
+  if (code === "auth/email-already-in-use") return "This email is already registered.";
+  if (code === "auth/invalid-email") return "Please enter a valid email address.";
+  if (code === "auth/weak-password") return "Password must be at least 6 characters.";
+  if (code === "auth/operation-not-allowed") return "Email/password sign-in is disabled in Firebase Auth.";
+  if (code === "auth/too-many-requests") return "Too many attempts. Please try again later.";
+  if (code === "auth/network-request-failed") return "Network error. Check your internet and try again.";
+  if (code === "permission-denied") return "Access blocked by Firestore rules. Update your Firestore rules and try again.";
+  if (code === "failed-precondition") return "Firebase project setup is incomplete. Check Firestore/Auth configuration.";
+  if (code === "unavailable") return "Firebase service is temporarily unavailable. Please try again.";
+  return "Authentication failed.";
+}
+
+function isPermissionDenied(error) {
+  return (error?.code || "") === "permission-denied";
 }
 
 function initials(name) {
@@ -72,9 +141,16 @@ function isUserOnline(user) {
   return toMillis(user.lastActiveAt) >= Date.now() - ACTIVE_WINDOW_MS;
 }
 
-function Avatar({ name, photoURL, className = "avatar", isOnline = false, showOnlineDot = false }) {
+function Avatar({
+  name,
+  photoURL,
+  className = "avatar",
+  isOnline = false,
+  showOnlineDot = false,
+  onClick,
+}) {
   return (
-    <span className="avatarWrap">
+    <span className={`avatarWrap ${onClick ? "avatarWrapClickable" : ""}`} onClick={onClick}>
       {photoURL ? (
         <img src={photoURL} alt={name || "User"} className={`${className} avatarImage`} />
       ) : (
@@ -188,6 +264,9 @@ export default function App() {
   const [authMode, setAuthMode] = useState("login");
   const [authForm, setAuthForm] = useState({ email: "", password: "", username: "" });
   const [authError, setAuthError] = useState("");
+  const [showForgotPassword, setShowForgotPassword] = useState(false);
+  const [forgotEmail, setForgotEmail] = useState("");
+  const [forgotStatus, setForgotStatus] = useState("");
   const [capacityError, setCapacityError] = useState("");
   const [currentUser, setCurrentUser] = useState(null);
   const [userProfile, setUserProfile] = useState(null);
@@ -240,6 +319,14 @@ export default function App() {
   const [groupNameDraft, setGroupNameDraft] = useState("");
   const [groupPhotoFile, setGroupPhotoFile] = useState(null);
   const [groupStatus, setGroupStatus] = useState("");
+  const [showGroupProfile, setShowGroupProfile] = useState(false);
+  const [groupProfileNameDraft, setGroupProfileNameDraft] = useState("");
+  const [groupDescriptionDraft, setGroupDescriptionDraft] = useState("");
+  const [groupProfileStatus, setGroupProfileStatus] = useState("");
+  const [memberToAddId, setMemberToAddId] = useState("");
+  const [subgroupNameDraft, setSubgroupNameDraft] = useState("");
+  const [subgroupStatus, setSubgroupStatus] = useState("");
+  const [selectedSubgroupMemberIds, setSelectedSubgroupMemberIds] = useState([]);
   const [savedStatus, setSavedStatus] = useState("");
   const [composerStatus, setComposerStatus] = useState("");
   const [showSpamWarning, setShowSpamWarning] = useState(false);
@@ -252,6 +339,7 @@ export default function App() {
     if (typeof Notification === "undefined") return "unsupported";
     return Notification.permission;
   });
+  const [fcmStatus, setFcmStatus] = useState("");
   const mediaInputRef = useRef(null);
   const documentInputRef = useRef(null);
   const typingTextRef = useRef("");
@@ -280,6 +368,47 @@ export default function App() {
     const uid = (selectedChat.members || []).find((member) => member !== currentUser.uid);
     return uid ? usersById.get(uid) : null;
   }, [selectedChat, currentUser, usersById]);
+  const selectedGroupRole = useMemo(
+    () => getGroupRole(selectedChat, currentUser?.uid),
+    [selectedChat, currentUser],
+  );
+  const canEditSelectedGroupCore = useMemo(
+    () => canManageGroupCore(selectedChat, currentUser?.uid),
+    [selectedChat, currentUser],
+  );
+  const canManageSelectedSubgroups = useMemo(
+    () => canManageGroupSubgroups(selectedChat, currentUser?.uid),
+    [selectedChat, currentUser],
+  );
+  const activeGroupRootId = useMemo(() => {
+    if (!selectedChat?.isGroup) return "";
+    return selectedChat.parentGroupId || selectedChat.id;
+  }, [selectedChat]);
+  const selectedGroupSubgroups = useMemo(() => {
+    if (!activeGroupRootId) return [];
+    return chats.filter((chat) => chat.parentGroupId === activeGroupRootId);
+  }, [chats, activeGroupRootId]);
+  const activeGroupRoot = useMemo(() => {
+    if (!activeGroupRootId) return null;
+    if (selectedChat?.id === activeGroupRootId) return selectedChat;
+    return chats.find((chat) => chat.id === activeGroupRootId) || null;
+  }, [activeGroupRootId, selectedChat, chats]);
+  const mainChatList = useMemo(
+    () => chats.filter((chat) => !chat.isSubgroup),
+    [chats],
+  );
+  const subgroupNavItems = useMemo(() => {
+    if (!activeGroupRoot) return [];
+    return [activeGroupRoot, ...selectedGroupSubgroups.filter((chat) => chat.id !== activeGroupRoot.id)];
+  }, [activeGroupRoot, selectedGroupSubgroups]);
+  const selectedGroupMembers = useMemo(() => {
+    if (!selectedChat?.isGroup) return [];
+    return (selectedChat.members || []).map((uid) => ({
+      uid,
+      user: usersById.get(uid) || null,
+      role: getGroupRole(selectedChat, uid),
+    }));
+  }, [selectedChat, usersById]);
 
   const username = userProfile?.username || currentUser?.displayName || "User";
   const isCurrentUserOnline = isUserOnline(userProfile);
@@ -301,7 +430,35 @@ export default function App() {
     () => directFriendIds.map((id) => usersById.get(id)).filter(Boolean),
     [directFriendIds, usersById],
   );
+  const addableGroupFriends = useMemo(() => {
+    if (!selectedChat?.isGroup) return [];
+    const memberSet = new Set(selectedChat.members || []);
+    return availableGroupFriends.filter((friend) => !memberSet.has(friend.id));
+  }, [availableGroupFriends, selectedChat]);
+  const subgroupCandidateMembers = useMemo(() => {
+    if (!selectedChat?.isGroup) return [];
+    return (selectedChat.members || [])
+      .filter((uid) => uid !== currentUser?.uid)
+      .map((uid) => usersById.get(uid))
+      .filter(Boolean);
+  }, [selectedChat, usersById, currentUser]);
   const savedMessageIds = useMemo(() => new Set(savedMessages.map((item) => item.id)), [savedMessages]);
+  const groupedMessages = useMemo(() => {
+    const groups = [];
+    for (const message of messages) {
+      const prev = groups[groups.length - 1];
+      if (prev && prev.senderId === message.senderId) {
+        prev.items.push(message);
+      } else {
+        groups.push({
+          id: message.id,
+          senderId: message.senderId || "",
+          items: [message],
+        });
+      }
+    }
+    return groups;
+  }, [messages]);
 
   function buildSavedId(chatId, messageId) {
     return `${chatId}_${messageId}`;
@@ -395,13 +552,39 @@ export default function App() {
     setShowSavedContent(false);
     setShowUserProfileView(false);
     setShowEventScheduler(false);
+    setShowGroupProfile(false);
     setViewedUserId("");
+    setGroupProfileStatus("");
+    setSubgroupStatus("");
   }
 
   function toggleGroupMember(uid) {
     setSelectedGroupMemberIds((prev) =>
       prev.includes(uid) ? prev.filter((id) => id !== uid) : [...prev, uid],
     );
+  }
+
+  function toggleSubgroupMember(uid) {
+    setSelectedSubgroupMemberIds((prev) =>
+      prev.includes(uid) ? prev.filter((id) => id !== uid) : [...prev, uid],
+    );
+  }
+
+  function openGroupProfilePopup() {
+    if (!selectedChat?.isGroup) return;
+    setShowGroupProfile(true);
+    setShowAddFriend(false);
+    setShowCreateGroup(false);
+    setShowNotifications(false);
+    setShowProfile(false);
+    setShowEventScheduler(false);
+    setGroupProfileNameDraft(selectedChat.groupName || "");
+    setGroupDescriptionDraft(selectedChat.groupDescription || "");
+    setGroupProfileStatus("");
+    setSubgroupNameDraft("");
+    setSubgroupStatus("");
+    setSelectedSubgroupMemberIds([]);
+    setMemberToAddId("");
   }
 
   function pushBrowserNotification(title, body) {
@@ -416,16 +599,85 @@ export default function App() {
     }
   }
 
+  async function registerMessagingServiceWorker() {
+    if (typeof window === "undefined" || !("serviceWorker" in navigator)) return null;
+    const config = {
+      apiKey: import.meta.env.VITE_FIREBASE_API_KEY || "",
+      authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || "",
+      projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID || "",
+      storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET || "",
+      messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || "",
+      appId: import.meta.env.VITE_FIREBASE_APP_ID || "",
+    };
+    const params = new URLSearchParams(config).toString();
+    return navigator.serviceWorker.register(`/firebase-messaging-sw.js?${params}`);
+  }
+
+  async function enablePushNotificationsForCurrentUser() {
+    if (!currentUser) {
+      setFcmStatus("Sign in first, then enable push notifications.");
+      return;
+    }
+
+    const vapidKey = import.meta.env.VITE_FIREBASE_VAPID_KEY;
+    if (!vapidKey) {
+      setFcmStatus("Missing VITE_FIREBASE_VAPID_KEY in .env.");
+      return;
+    }
+
+    const messaging = await getFirebaseMessaging();
+    if (!messaging) {
+      setFcmStatus("Push messaging is not supported in this browser.");
+      return;
+    }
+
+    const registration = await registerMessagingServiceWorker();
+    if (!registration) {
+      setFcmStatus("Service worker is not available for push notifications.");
+      return;
+    }
+
+    const token = await getToken(messaging, { vapidKey, serviceWorkerRegistration: registration });
+    if (!token) {
+      setFcmStatus("Could not get an FCM token for this device.");
+      return;
+    }
+
+    await setDoc(
+      doc(db, "users", currentUser.uid),
+      {
+        fcmTokens: arrayUnion(token),
+        pushEnabledAt: serverTimestamp(),
+      },
+      { merge: true },
+    );
+    setFcmStatus("Push notifications enabled on this device.");
+  }
+
   async function requestNotificationPermission() {
     if (typeof Notification === "undefined") {
       setNotificationPermission("unsupported");
+      setFcmStatus("Notifications are not supported in this browser.");
       return;
     }
     try {
       const result = await Notification.requestPermission();
       setNotificationPermission(result);
+      if (result !== "granted") {
+        setFcmStatus("Notification permission was not granted.");
+        return;
+      }
+      await enablePushNotificationsForCurrentUser();
     } catch {
       setNotificationPermission(Notification.permission);
+      setFcmStatus("Failed to enable push notifications.");
+    }
+  }
+
+  function handleListenerError(error) {
+    if (isPermissionDenied(error)) {
+      setAuthError("Access blocked by Firestore rules. Update your Firestore rules and try again.");
+      signOut(auth).catch(() => {});
     }
   }
 
@@ -459,15 +711,48 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!currentUser) {
+      setFcmStatus("");
+      return;
+    }
+    if (notificationPermission !== "granted") return;
+    enablePushNotificationsForCurrentUser().catch(() => {});
+  }, [currentUser, notificationPermission]);
+
+  useEffect(() => {
+    if (notificationPermission !== "granted") return undefined;
+    let unsub = () => {};
+    getFirebaseMessaging()
+      .then((messaging) => {
+        if (!messaging) return;
+        unsub = onMessage(messaging, (payload) => {
+          const title = payload.notification?.title || "Textinger";
+          const body = payload.notification?.body || "You have a new notification.";
+          pushBrowserNotification(title, body);
+        });
+      })
+      .catch(() => {});
+    return () => unsub();
+  }, [notificationPermission]);
+
+  useEffect(() => {
     if (!currentUser) return undefined;
 
-    const userDocUnsub = onSnapshot(doc(db, "users", currentUser.uid), (snap) => {
-      setUserProfile(snap.exists() ? { id: snap.id, ...snap.data() } : null);
-    });
+    const userDocUnsub = onSnapshot(
+      doc(db, "users", currentUser.uid),
+      (snap) => {
+        setUserProfile(snap.exists() ? { id: snap.id, ...snap.data() } : null);
+      },
+      handleListenerError,
+    );
 
-    const usersUnsub = onSnapshot(collection(db, "users"), (snapshot) => {
-      setUsers(snapshot.docs.map((d) => ({ id: d.id, ...d.data() })));
-    });
+    const usersUnsub = onSnapshot(
+      collection(db, "users"),
+      (snapshot) => {
+        setUsers(snapshot.docs.map((d) => ({ id: d.id, ...d.data() })));
+      },
+      handleListenerError,
+    );
 
     const chatsUnsub = onSnapshot(
       query(collection(db, "chats"), where("members", "array-contains", currentUser.uid)),
@@ -477,6 +762,7 @@ export default function App() {
           .sort((a, b) => (b.updatedAt?.toMillis?.() || 0) - (a.updatedAt?.toMillis?.() || 0));
         setChats(list);
       },
+      handleListenerError,
     );
 
     const requestsUnsub = onSnapshot(
@@ -488,14 +774,19 @@ export default function App() {
             .filter((request) => request.status === "pending"),
         );
       },
+      handleListenerError,
     );
 
-    const savedUnsub = onSnapshot(collection(db, "users", currentUser.uid, "savedMessages"), (snapshot) => {
-      const list = snapshot.docs
-        .map((d) => ({ id: d.id, ...d.data() }))
-        .sort((a, b) => (b.savedAt?.toMillis?.() || 0) - (a.savedAt?.toMillis?.() || 0));
-      setSavedMessages(list);
-    });
+    const savedUnsub = onSnapshot(
+      collection(db, "users", currentUser.uid, "savedMessages"),
+      (snapshot) => {
+        const list = snapshot.docs
+          .map((d) => ({ id: d.id, ...d.data() }))
+          .sort((a, b) => (b.savedAt?.toMillis?.() || 0) - (a.savedAt?.toMillis?.() || 0));
+        setSavedMessages(list);
+      },
+      handleListenerError,
+    );
 
     return () => {
       userDocUnsub();
@@ -580,6 +871,9 @@ export default function App() {
         setMessages(snapshot.docs.map((d) => ({ id: d.id, ...d.data() })));
         setMessagesLoading(false);
       },
+      () => {
+        setMessagesLoading(false);
+      },
     );
     return () => unsub();
   }, [selectedChatId]);
@@ -620,12 +914,16 @@ export default function App() {
       return undefined;
     }
 
-    const typingUnsub = onSnapshot(collection(db, "chats", selectedChatId, "typing"), (snapshot) => {
-      const list = snapshot.docs
-        .map((d) => ({ id: d.id, ...d.data() }))
-        .filter((entry) => entry.id !== currentUser.uid && entry.isTyping);
-      setTypingStreams(list);
-    });
+    const typingUnsub = onSnapshot(
+      collection(db, "chats", selectedChatId, "typing"),
+      (snapshot) => {
+        const list = snapshot.docs
+          .map((d) => ({ id: d.id, ...d.data() }))
+          .filter((entry) => entry.id !== currentUser.uid && entry.isTyping);
+        setTypingStreams(list);
+      },
+      () => {},
+    );
 
     return () => typingUnsub();
   }, [selectedChatId, currentUser]);
@@ -655,6 +953,12 @@ export default function App() {
     setProfileNameDraft(username);
     setProfileBioDraft(userProfile?.bio || "");
   }, [showProfile, username]);
+
+  useEffect(() => {
+    if (!showGroupProfile || !selectedChat?.isGroup) return;
+    setGroupProfileNameDraft(selectedChat.groupName || "");
+    setGroupDescriptionDraft(selectedChat.groupDescription || "");
+  }, [showGroupProfile, selectedChat]);
 
   useEffect(() => {
     if (!currentUser) {
@@ -879,30 +1183,35 @@ export default function App() {
 
         const cred = await createUserWithEmailAndPassword(auth, email, password);
         try {
-          const onlineUsersSnap = await getDocs(
-            query(usersRef, where("isOnline", "==", true), limit(MAX_TOTAL_USERS)),
-          );
-          const activeCutoff = Date.now() - ACTIVE_WINDOW_MS;
-          const activeUserIds = new Set(
-            onlineUsersSnap.docs
-              .filter((entry) => toMillis(entry.data()?.lastActiveAt) >= activeCutoff)
-              .map((entry) => entry.id),
-          );
-          const totalUsersSnap = await getCountFromServer(usersRef);
-          const totalUsers = totalUsersSnap.data().count || 0;
-          const activeWithoutCurrent = activeUserIds.has(cred.user.uid)
-            ? activeUserIds.size - 1
-            : activeUserIds.size;
+          try {
+            const onlineUsersSnap = await getDocs(
+              query(usersRef, where("isOnline", "==", true), limit(MAX_TOTAL_USERS)),
+            );
+            const activeCutoff = Date.now() - ACTIVE_WINDOW_MS;
+            const activeUserIds = new Set(
+              onlineUsersSnap.docs
+                .filter((entry) => toMillis(entry.data()?.lastActiveAt) >= activeCutoff)
+                .map((entry) => entry.id),
+            );
+            const totalUsersSnap = await getCountFromServer(usersRef);
+            const totalUsers = totalUsersSnap.data().count || 0;
+            const activeWithoutCurrent = activeUserIds.has(cred.user.uid)
+              ? activeUserIds.size - 1
+              : activeUserIds.size;
 
-          if (totalUsers >= MAX_TOTAL_USERS || activeWithoutCurrent >= MAX_ACTIVE_USERS) {
-            await deleteUser(cred.user);
-            await signOut(auth);
-            if (totalUsers >= MAX_TOTAL_USERS) {
-              setCapacityError(`Signup closed: max ${MAX_TOTAL_USERS} accounts reached.`);
-            } else {
-              setCapacityError(`Try later: max ${MAX_ACTIVE_USERS} active users reached.`);
+            if (totalUsers >= MAX_TOTAL_USERS || activeWithoutCurrent >= MAX_ACTIVE_USERS) {
+              await deleteUser(cred.user);
+              await signOut(auth);
+              if (totalUsers >= MAX_TOTAL_USERS) {
+                setCapacityError(`Signup closed: max ${MAX_TOTAL_USERS} accounts reached.`);
+              } else {
+                setCapacityError(`Try later: max ${MAX_ACTIVE_USERS} active users reached.`);
+              }
+              return;
             }
-            return;
+          } catch (capacityError) {
+            // Do not block signup when optional capacity checks are denied by rules.
+            if (!isPermissionDenied(capacityError)) throw capacityError;
           }
 
           await updateProfile(cred.user, { displayName: newUsername });
@@ -916,6 +1225,8 @@ export default function App() {
             lastActiveAt: serverTimestamp(),
             createdAt: serverTimestamp(),
           });
+          await sendEmailVerification(cred.user).catch(() => {});
+          setAuthError("Account created. Verification email sent.");
         } catch (innerError) {
           try {
             await deleteUser(cred.user);
@@ -927,26 +1238,52 @@ export default function App() {
         }
       } else {
         const cred = await signInWithEmailAndPassword(auth, email, password);
-        const onlineUsersSnap = await getDocs(
-          query(usersRef, where("isOnline", "==", true), limit(MAX_TOTAL_USERS)),
-        );
-        const activeCutoff = Date.now() - ACTIVE_WINDOW_MS;
-        const activeUserIds = new Set(
-          onlineUsersSnap.docs
-            .filter((entry) => toMillis(entry.data()?.lastActiveAt) >= activeCutoff)
-            .map((entry) => entry.id),
-        );
-        const isAlreadyActive = activeUserIds.has(cred.user.uid);
-        if (!isAlreadyActive && activeUserIds.size >= MAX_ACTIVE_USERS) {
-          await signOut(auth);
-          setCapacityError(`Try later: max ${MAX_ACTIVE_USERS} active users reached.`);
-          return;
+        await cred.user.reload();
+        try {
+          const onlineUsersSnap = await getDocs(
+            query(usersRef, where("isOnline", "==", true), limit(MAX_TOTAL_USERS)),
+          );
+          const activeCutoff = Date.now() - ACTIVE_WINDOW_MS;
+          const activeUserIds = new Set(
+            onlineUsersSnap.docs
+              .filter((entry) => toMillis(entry.data()?.lastActiveAt) >= activeCutoff)
+              .map((entry) => entry.id),
+          );
+          const isAlreadyActive = activeUserIds.has(cred.user.uid);
+          if (!isAlreadyActive && activeUserIds.size >= MAX_ACTIVE_USERS) {
+            await signOut(auth);
+            setCapacityError(`Try later: max ${MAX_ACTIVE_USERS} active users reached.`);
+            return;
+          }
+        } catch (capacityError) {
+          // Do not block login when optional capacity checks are denied by rules.
+          if (!isPermissionDenied(capacityError)) throw capacityError;
         }
       }
 
       setAuthForm({ email, password: "", username: "" });
     } catch (error) {
-      setAuthError(error.message || "Authentication failed.");
+      setAuthError(normalizeAuthError(error));
+    } finally {
+      setBusyLabel("");
+    }
+  }
+
+  async function handleForgotPasswordSubmit(event) {
+    event.preventDefault();
+    setForgotStatus("");
+    const email = forgotEmail.trim().toLowerCase();
+    if (!email) {
+      setForgotStatus("Please enter your email.");
+      return;
+    }
+
+    try {
+      setBusyLabel("Sending reset email...");
+      await sendPasswordResetEmail(auth, email);
+      setForgotStatus("If this email is registered, a password reset mail has been sent.");
+    } catch {
+      setForgotStatus("Unable to process reset right now. Please try again.");
     } finally {
       setBusyLabel("");
     }
@@ -965,7 +1302,7 @@ export default function App() {
     setSending(true);
     try {
       setComposerStatus("");
-      setBusyLabel("Sending message...");
+      if (mediaFile) setBusyLabel("Uploading media...");
       let mediaURL = "";
       let mediaType = "";
       let mediaName = "";
@@ -1164,6 +1501,8 @@ export default function App() {
 
   async function removeMessage(messageId) {
     if (!selectedChatId) return;
+    const message = messages.find((entry) => entry.id === messageId);
+    if (!canDeleteGroupMessage(selectedChat, message, currentUser?.uid)) return;
     if (!window.confirm("Delete this message?")) return;
     setBusyLabel("Deleting message...");
     try {
@@ -1250,11 +1589,17 @@ export default function App() {
       }
 
       const members = Array.from(new Set([currentUser.uid, ...selectedGroupMemberIds]));
+      const groupRoles = members.reduce((acc, uid) => {
+        acc[uid] = uid === currentUser.uid ? "owner" : "member";
+        return acc;
+      }, {});
       const groupRef = await addDoc(collection(db, "chats"), {
         isGroup: true,
         groupName: name,
+        groupDescription: "",
         groupPhotoURL,
         members,
+        groupRoles,
         createdBy: currentUser.uid,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
@@ -1267,6 +1612,198 @@ export default function App() {
       closePopups();
     } catch (error) {
       setGroupStatus(error.message || "Failed to create group.");
+    } finally {
+      setBusyLabel("");
+    }
+  }
+
+  async function saveGroupProfile() {
+    if (!currentUser || !selectedChat?.isGroup) return;
+    if (!canManageGroupCore(selectedChat, currentUser.uid)) {
+      setGroupProfileStatus("Only the creator or an owner can edit this group.");
+      return;
+    }
+
+    const nextName = groupProfileNameDraft.trim();
+    if (!nextName) {
+      setGroupProfileStatus("Group name is required.");
+      return;
+    }
+
+    setBusyLabel("Saving group profile...");
+    setGroupProfileStatus("");
+    try {
+      await updateDoc(doc(db, "chats", selectedChat.id), {
+        groupName: nextName,
+        groupDescription: groupDescriptionDraft.trim(),
+        updatedAt: serverTimestamp(),
+      });
+      setGroupProfileStatus("Group profile updated.");
+    } catch (error) {
+      setGroupProfileStatus(error.message || "Failed to update group profile.");
+    } finally {
+      setBusyLabel("");
+    }
+  }
+
+  async function addMemberToGroup(memberId) {
+    if (!currentUser || !selectedChat?.isGroup || !memberId) return;
+    if (!canManageGroupCore(selectedChat, currentUser.uid)) {
+      setGroupProfileStatus("Only the creator or an owner can add members.");
+      return;
+    }
+
+    setBusyLabel("Adding member...");
+    setGroupProfileStatus("");
+    try {
+      const chatRef = doc(db, "chats", selectedChat.id);
+      await runTransaction(db, async (transaction) => {
+        const snap = await transaction.get(chatRef);
+        if (!snap.exists()) throw new Error("Group no longer exists.");
+        const data = snap.data();
+        if (!canManageGroupCore(data, currentUser.uid)) {
+          throw new Error("Permission denied.");
+        }
+        const members = Array.isArray(data.members) ? [...data.members] : [];
+        if (members.includes(memberId)) return;
+        members.push(memberId);
+        const roles = { ...(data.groupRoles || {}) };
+        if (!GROUP_ROLES.includes(roles[memberId])) roles[memberId] = "member";
+        transaction.update(chatRef, {
+          members,
+          groupRoles: roles,
+          updatedAt: serverTimestamp(),
+        });
+      });
+      setMemberToAddId("");
+      setGroupProfileStatus("Member added.");
+    } catch (error) {
+      setGroupProfileStatus(error.message || "Failed to add member.");
+    } finally {
+      setBusyLabel("");
+    }
+  }
+
+  async function removeMemberFromGroup(memberId) {
+    if (!currentUser || !selectedChat?.isGroup || !memberId) return;
+    if (!canManageGroupCore(selectedChat, currentUser.uid)) {
+      setGroupProfileStatus("Only the creator or an owner can remove members.");
+      return;
+    }
+    if (memberId === selectedChat.createdBy) {
+      setGroupProfileStatus("The creator cannot be removed.");
+      return;
+    }
+
+    setBusyLabel("Removing member...");
+    setGroupProfileStatus("");
+    try {
+      const chatRef = doc(db, "chats", selectedChat.id);
+      await runTransaction(db, async (transaction) => {
+        const snap = await transaction.get(chatRef);
+        if (!snap.exists()) throw new Error("Group no longer exists.");
+        const data = snap.data();
+        if (!canManageGroupCore(data, currentUser.uid)) throw new Error("Permission denied.");
+        if (memberId === data.createdBy) throw new Error("The creator cannot be removed.");
+        const members = (Array.isArray(data.members) ? data.members : []).filter((uid) => uid !== memberId);
+        const roles = { ...(data.groupRoles || {}) };
+        delete roles[memberId];
+        transaction.update(chatRef, {
+          members,
+          groupRoles: roles,
+          updatedAt: serverTimestamp(),
+        });
+      });
+      setGroupProfileStatus("Member removed.");
+    } catch (error) {
+      setGroupProfileStatus(error.message || "Failed to remove member.");
+    } finally {
+      setBusyLabel("");
+    }
+  }
+
+  async function updateGroupMemberRole(memberId, nextRole) {
+    if (!currentUser || !selectedChat?.isGroup || !memberId) return;
+    if (!GROUP_ROLES.includes(nextRole)) return;
+    if (!canManageGroupCore(selectedChat, currentUser.uid)) {
+      setGroupProfileStatus("Only the creator or an owner can change roles.");
+      return;
+    }
+
+    setBusyLabel("Updating role...");
+    setGroupProfileStatus("");
+    try {
+      const chatRef = doc(db, "chats", selectedChat.id);
+      await runTransaction(db, async (transaction) => {
+        const snap = await transaction.get(chatRef);
+        if (!snap.exists()) throw new Error("Group no longer exists.");
+        const data = snap.data();
+        if (!canManageGroupCore(data, currentUser.uid)) throw new Error("Permission denied.");
+        if (memberId === data.createdBy) throw new Error("Creator role cannot be changed.");
+        const members = Array.isArray(data.members) ? data.members : [];
+        if (!members.includes(memberId)) throw new Error("User is not in this group.");
+        const roles = { ...(data.groupRoles || {}) };
+        roles[memberId] = nextRole;
+        transaction.update(chatRef, {
+          groupRoles: roles,
+          updatedAt: serverTimestamp(),
+        });
+      });
+      setGroupProfileStatus("Role updated.");
+    } catch (error) {
+      setGroupProfileStatus(error.message || "Failed to update role.");
+    } finally {
+      setBusyLabel("");
+    }
+  }
+
+  async function createSubgroup() {
+    if (!currentUser || !selectedChat?.isGroup) return;
+    if (!canManageGroupSubgroups(selectedChat, currentUser.uid)) {
+      setSubgroupStatus("Only creator, owner, or admin can create subgroups.");
+      return;
+    }
+    const name = subgroupNameDraft.trim();
+    if (!name) {
+      setSubgroupStatus("Subgroup name is required.");
+      return;
+    }
+
+    const parentMembers = new Set(selectedChat.members || []);
+    const filteredMemberIds = selectedSubgroupMemberIds.filter((uid) => parentMembers.has(uid));
+    const members = Array.from(new Set([currentUser.uid, ...filteredMemberIds]));
+    const groupRoles = members.reduce((acc, uid) => {
+      acc[uid] = uid === currentUser.uid ? "owner" : "member";
+      return acc;
+    }, {});
+
+    setBusyLabel("Creating subgroup...");
+    setSubgroupStatus("");
+    try {
+      const subgroupRef = await addDoc(collection(db, "chats"), {
+        isGroup: true,
+        isSubgroup: true,
+        parentGroupId: selectedChat.id,
+        groupName: name,
+        groupDescription: "",
+        groupPhotoURL: "",
+        members,
+        groupRoles,
+        createdBy: currentUser.uid,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        lastMessage: "No messages yet",
+        lastSenderId: "",
+      });
+      await updateDoc(doc(db, "chats", selectedChat.id), {
+        subgroupIds: arrayUnion(subgroupRef.id),
+        updatedAt: serverTimestamp(),
+      });
+      setSubgroupNameDraft("");
+      setSelectedSubgroupMemberIds([]);
+      setSubgroupStatus("Subgroup created.");
+    } catch (error) {
+      setSubgroupStatus(error.message || "Failed to create subgroup.");
     } finally {
       setBusyLabel("");
     }
@@ -1347,7 +1884,7 @@ export default function App() {
           </div>
           <section className="authCard">
           <h1>Textinger</h1>
-          <p>Email + password login with username registration.</p>
+          <p>Email and password login with username registration.</p>
           <div className="authSwitch">
             <button
               type="button"
@@ -1393,6 +1930,19 @@ export default function App() {
               required
             />
             <button type="submit">{authMode === "register" ? "Create Account" : "Login"}</button>
+            {authMode === "login" && (
+              <button
+                type="button"
+                className="ghost"
+                onClick={() => {
+                  setForgotEmail(authForm.email || "");
+                  setForgotStatus("");
+                  setShowForgotPassword(true);
+                }}
+              >
+                Forgot Password?
+              </button>
+            )}
           </form>
 
           {capacityError && <p className="errorText">{capacityError}</p>}
@@ -1405,6 +1955,29 @@ export default function App() {
               <div className="loaderDot" />
               <p>{busyLabel}</p>
             </div>
+          </div>
+        )}
+        {showForgotPassword && (
+          <div className="popupBackdrop" onClick={() => setShowForgotPassword(false)}>
+            <section className="popupCard" onClick={(event) => event.stopPropagation()}>
+              <div className="popupHead">
+                <h3>Reset Password</h3>
+                <button type="button" className="ghost" onClick={() => setShowForgotPassword(false)}>
+                  Close
+                </button>
+              </div>
+              <form className="stack" onSubmit={handleForgotPasswordSubmit}>
+                <input
+                  type="email"
+                  placeholder="Registered email"
+                  value={forgotEmail}
+                  onChange={(event) => setForgotEmail(event.target.value)}
+                  required
+                />
+                <button type="submit">Send Reset Mail</button>
+              </form>
+              {forgotStatus && <p className="muted">{forgotStatus}</p>}
+            </section>
           </div>
         )}
       </>
@@ -1432,14 +2005,15 @@ export default function App() {
         </div>
 
         <div className="chatList">
-          {chats.length === 0 && <p className="muted">There is no message here.</p>}
-          {chats.map((chat) => {
+          {mainChatList.length === 0 && <p className="muted">There is no message here.</p>}
+          {mainChatList.map((chat) => {
             const otherUid = (chat.members || []).find((member) => member !== currentUser.uid);
             const other = otherUid ? usersById.get(otherUid) : null;
             const name = chat.isGroup ? chat.groupName || "Unnamed Group" : other?.username || "Unknown user";
             const photo = chat.isGroup ? chat.groupPhotoURL || "" : other?.photoURL || "";
             const showOnline = !chat.isGroup;
             const chatUserOnline = showOnline && isUserOnline(other);
+            const preview = truncateText(chat.lastMessage || "No messages yet");
             return (
               <button
                 type="button"
@@ -1452,10 +2026,14 @@ export default function App() {
                   photoURL={photo}
                   isOnline={chatUserOnline}
                   showOnlineDot={showOnline}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    if (!chat.isGroup && otherUid) openUserProfileView(otherUid);
+                  }}
                 />
                 <span className="chatMeta">
-                  <strong>{name}</strong>
-                  <small>{chat.lastMessage || "No messages yet"}</small>
+                  <strong>{truncateText(name, 24)}</strong>
+                  <small>{preview}</small>
                 </span>
                 {unreadChatIds.includes(chat.id) && <span className="unreadDot" />}
                 {eventPulseChatIds.includes(chat.id) && <span className="eventDot" />}
@@ -1475,9 +2053,13 @@ export default function App() {
             )}
             <div>
             <h1>
-              {selectedChat?.isGroup
-                ? selectedChat.groupName || "Unnamed Group"
-                : selectedChatOtherUser?.username || "Textinger"}
+              {selectedChat?.isGroup ? (
+                <button type="button" className="groupTitleBtn" onClick={openGroupProfilePopup}>
+                  {selectedChat.groupName || "Unnamed Group"}
+                </button>
+              ) : (
+                selectedChatOtherUser?.username || "Textinger"
+              )}
               {!selectedChat?.isGroup && (
                 <span className={`userStatusText ${isSelectedUserOnline ? "online" : "offline"}`}>
                   {isSelectedUserOnline ? "Online" : "Offline"}
@@ -1486,8 +2068,10 @@ export default function App() {
             </h1>
             <small>
               {selectedChat?.isGroup
-                ? `${selectedChat.members?.length || 0} members`
-                : selectedChatOtherUser?.email || "Realtime Firebase chat"}
+                ? `${selectedChat.members?.length || 0} members • ${roleLabel(selectedGroupRole)}${selectedChat?.isSubgroup ? " • Subgroup" : ""}`
+                : isSelectedUserOnline
+                  ? "Online"
+                  : "Offline"}
             </small>
             </div>
           </div>
@@ -1501,142 +2085,154 @@ export default function App() {
           </div>
         </header>
 
+        <div className={`panelBody ${selectedChat?.isGroup ? "withSubgroups" : ""}`}>
         <section className="messageArea">
           {selectedChat ? (
             <>
               <div className="messages">
                 {messagesLoading && <p className="muted">Loading messages...</p>}
                 {!messagesLoading && messages.length === 0 && <p className="muted">There is no message here.</p>}
-                {messages.map((msg) => {
-                  const senderUser = usersById.get(msg.senderId);
+                {groupedMessages.map((group) => {
+                  const senderUser = usersById.get(group.senderId);
                   const senderName =
-                    msg.senderId === currentUser.uid
+                    group.senderId === currentUser.uid
                       ? username
-                      : senderUser?.username || msg.senderName || msg.user || "Unknown";
+                      : senderUser?.username || group.items[0]?.senderName || group.items[0]?.user || "Unknown";
                   const senderPhoto =
-                    msg.senderId === currentUser.uid
+                    group.senderId === currentUser.uid
                       ? userProfile?.photoURL || currentUser.photoURL || ""
                       : senderUser?.photoURL || "";
                   const senderOnline =
-                    msg.senderId === currentUser.uid ? isCurrentUserOnline : isUserOnline(senderUser);
+                    group.senderId === currentUser.uid ? isCurrentUserOnline : isUserOnline(senderUser);
                   return (
                     <article
-                      key={msg.id}
-                      className={`bubble ${msg.senderId === currentUser.uid ? "own" : ""}`}
+                      key={group.id}
+                      className={`bubble ${group.senderId === currentUser.uid ? "own" : ""}`}
                     >
                       <div className="meta">
                         <div className="metaUser">
                           <button
                             type="button"
                             className="ghost profilePeek"
-                            onClick={() => openUserProfileView(msg.senderId)}
+                            onClick={() => openUserProfileView(group.senderId)}
                           >
                             <Avatar
                               name={senderName}
                               photoURL={senderPhoto}
                               className="metaAvatar"
                               isOnline={senderOnline}
-                              showOnlineDot={Boolean(senderUser) || msg.senderId === currentUser.uid}
+                              showOnlineDot={Boolean(senderUser) || group.senderId === currentUser.uid}
                             />
                             <strong>{senderName}</strong>
                           </button>
                         </div>
-                        <small>
-                          {formatTime(msg.createdAt)}
-                          {msg.editedAt ? " (edited)" : ""}
-                        </small>
                       </div>
-                      {editingMessageId === msg.id ? (
-                        <div className="editBox">
-                          <input
-                            type="text"
-                            value={editingText}
-                            onChange={(event) => setEditingText(event.target.value)}
-                            maxLength={500}
-                          />
-                          <div className="editActions">
-                            <button type="button" onClick={() => saveEditMessage(msg)}>
-                              Save
-                            </button>
-                            <button type="button" className="ghost" onClick={cancelEditMessage}>
-                              Cancel
-                            </button>
-                          </div>
-                        </div>
-                      ) : (
-                        msg.text && <p>{msg.text}</p>
-                      )}
-                      {msg.mediaURL && (
-                        <div className="mediaBlock">
-                          {msg.mediaType?.startsWith("image/") ? (
-                            <img
-                              src={msg.mediaURL}
-                              alt={msg.mediaName || "image"}
-                              className="msgImage"
-                              onClick={() => {
-                                setPreviewImage(msg.mediaURL);
-                                setPreviewZoom(1);
-                              }}
-                            />
-                          ) : msg.mediaType?.startsWith("video/") ? (
-                            <video controls className="msgVideo">
-                              <source src={msg.mediaURL} type={msg.mediaType} />
-                            </video>
-                          ) : msg.mediaType?.startsWith("audio/") ? (
-                            <audio controls className="msgAudio">
-                              <source src={msg.mediaURL} type={msg.mediaType} />
-                            </audio>
-                          ) : (
-                            <a href={msg.mediaURL} target="_blank" rel="noreferrer" className="fileLink">
-                              {msg.mediaName || "Open file"}
-                            </a>
-                          )}
-                        </div>
-                      )}
-                      <div className="messageMenuWrap">
-                        <button
-                          type="button"
-                          className="ghost menuTrigger"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            setOpenMessageMenuId((prev) => (prev === msg.id ? "" : msg.id));
-                          }}
-                        >
-                          ...
-                        </button>
-                        {openMessageMenuId === msg.id && (
-                          <div className="messageMenu" onClick={(event) => event.stopPropagation()}>
-                            <button type="button" className="ghost menuItem" onClick={() => copyMessage(msg)}>
-                              Copy
-                            </button>
-                            <button
-                              type="button"
-                              className="ghost menuItem"
-                              onClick={() => saveMessageForLater(msg)}
-                              disabled={savedMessageIds.has(buildSavedId(selectedChatId, msg.id))}
-                            >
-                              {savedMessageIds.has(buildSavedId(selectedChatId, msg.id)) ? "Saved" : "Save"}
-                            </button>
-                            {msg.senderId === currentUser.uid && (
-                              <>
-                                <button
-                                  type="button"
-                                  className="ghost menuItem"
-                                  onClick={() => beginEditMessage(msg)}
-                                >
-                                  Edit
-                                </button>
-                                <button
-                                  type="button"
-                                  className="ghost menuItem danger"
-                                  onClick={() => removeMessage(msg.id)}
-                                >
-                                  Delete
-                                </button>
-                              </>
-                            )}
-                          </div>
-                        )}
+                      <div className="groupedMessageStack">
+                        {group.items.map((msg) => {
+                          const canDeleteMessage = canDeleteGroupMessage(selectedChat, msg, currentUser?.uid);
+                          return (
+                            <div key={msg.id} className="groupedMessageItem">
+                              {editingMessageId === msg.id ? (
+                                <div className="editBox">
+                                  <input
+                                    type="text"
+                                    value={editingText}
+                                    onChange={(event) => setEditingText(event.target.value)}
+                                    maxLength={500}
+                                  />
+                                  <div className="editActions">
+                                    <button type="button" onClick={() => saveEditMessage(msg)}>
+                                      Save
+                                    </button>
+                                    <button type="button" className="ghost" onClick={cancelEditMessage}>
+                                      Cancel
+                                    </button>
+                                  </div>
+                                </div>
+                              ) : (
+                                msg.text && <p>{msg.text}</p>
+                              )}
+                              {msg.mediaURL && (
+                                <div className="mediaBlock">
+                                  {msg.mediaType?.startsWith("image/") ? (
+                                    <img
+                                      src={msg.mediaURL}
+                                      alt={msg.mediaName || "image"}
+                                      className="msgImage"
+                                      onClick={() => {
+                                        setPreviewImage(msg.mediaURL);
+                                        setPreviewZoom(1);
+                                      }}
+                                    />
+                                  ) : msg.mediaType?.startsWith("video/") ? (
+                                    <video controls className="msgVideo">
+                                      <source src={msg.mediaURL} type={msg.mediaType} />
+                                    </video>
+                                  ) : msg.mediaType?.startsWith("audio/") ? (
+                                    <audio controls className="msgAudio">
+                                      <source src={msg.mediaURL} type={msg.mediaType} />
+                                    </audio>
+                                  ) : (
+                                    <a href={msg.mediaURL} target="_blank" rel="noreferrer" className="fileLink">
+                                      {msg.mediaName || "Open file"}
+                                    </a>
+                                  )}
+                                </div>
+                              )}
+                              <div className="messageFoot">
+                                <small className="messageTime">
+                                  {formatTime(msg.createdAt)}
+                                  {msg.editedAt ? " (edited)" : ""}
+                                </small>
+                                <div className="messageMenuWrap">
+                                  <button
+                                    type="button"
+                                    className="ghost menuTrigger"
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      setOpenMessageMenuId((prev) => (prev === msg.id ? "" : msg.id));
+                                    }}
+                                  >
+                                    ...
+                                  </button>
+                                  {openMessageMenuId === msg.id && (
+                                    <div className="messageMenu" onClick={(event) => event.stopPropagation()}>
+                                      <button type="button" className="ghost menuItem" onClick={() => copyMessage(msg)}>
+                                        Copy
+                                      </button>
+                                      <button
+                                        type="button"
+                                        className="ghost menuItem"
+                                        onClick={() => saveMessageForLater(msg)}
+                                        disabled={savedMessageIds.has(buildSavedId(selectedChatId, msg.id))}
+                                      >
+                                        {savedMessageIds.has(buildSavedId(selectedChatId, msg.id)) ? "Saved" : "Save"}
+                                      </button>
+                                      {msg.senderId === currentUser.uid && (
+                                        <button
+                                          type="button"
+                                          className="ghost menuItem"
+                                          onClick={() => beginEditMessage(msg)}
+                                        >
+                                          Edit
+                                        </button>
+                                      )}
+                                      {canDeleteMessage && (
+                                        <button
+                                          type="button"
+                                          className="ghost menuItem danger"
+                                          onClick={() => removeMessage(msg.id)}
+                                        >
+                                          Delete
+                                        </button>
+                                      )}
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })}
                       </div>
                     </article>
                   );
@@ -1765,9 +2361,48 @@ export default function App() {
             </div>
           )}
         </section>
+        {selectedChat?.isGroup && (
+          <aside className="subgroupRail">
+            <div className="subgroupRailHead">
+              <h3>Subgroups</h3>
+              <small>{activeGroupRoot?.groupName || selectedChat.groupName || "Group"}</small>
+            </div>
+            <div className="subgroupList">
+              {subgroupNavItems.length === 0 && (
+                <p className="muted">No subgroups yet.</p>
+              )}
+              {subgroupNavItems.map((item) => {
+                const isMainGroup = item.id === activeGroupRoot?.id;
+                const preview = truncateText(item.lastMessage || "No messages yet", 48);
+                return (
+                  <button
+                    type="button"
+                    key={item.id}
+                    className={`subgroupRow ${selectedChatId === item.id ? "active" : ""} ${isMainGroup ? "mainGroup" : ""}`}
+                    onClick={() => openChat(item.id)}
+                  >
+                    <Avatar
+                      name={item.groupName || (isMainGroup ? "Main Group" : "Subgroup")}
+                      photoURL={item.groupPhotoURL || ""}
+                    />
+                    <span className="chatMeta">
+                      <strong>
+                        {isMainGroup
+                          ? `# ${truncateText(item.groupName || "Main Group", 22)}`
+                          : `# ${truncateText(item.groupName || "Unnamed Subgroup", 22)}`}
+                      </strong>
+                      <small>{preview}</small>
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </aside>
+        )}
+        </div>
         </section>
 
-        {(showAddFriend || showCreateGroup || showNotifications || showProfile || showEventScheduler) && (
+        {(showAddFriend || showCreateGroup || showNotifications || showProfile || showEventScheduler || showGroupProfile) && (
           <div className="popupBackdrop" onClick={closePopups}>
           {showAddFriend && (
             <section className="popupCard" onClick={(event) => event.stopPropagation()}>
@@ -1886,9 +2521,14 @@ export default function App() {
               </div>
               <div className="notifyTools">
                 <p className="muted">Browser alerts: {notificationPermission}</p>
-                <button type="button" className="ghost" onClick={requestNotificationPermission}>
-                  Enable Alerts
-                </button>
+                <p className="muted">
+                  Cloud messaging: {notificationPermission === "granted" ? "Access is granted" : fcmStatus || "not configured"}
+                </p>
+                {notificationPermission !== "granted" && (
+                  <button type="button" className="ghost" onClick={requestNotificationPermission}>
+                    Enable Push Notifications
+                  </button>
+                )}
               </div>
               {requests.length === 0 && <p className="muted">No pending requests.</p>}
               <div className="requestList">
@@ -1957,6 +2597,189 @@ export default function App() {
                 </div>
               </div>
               {eventStatus && <p className="muted">{eventStatus}</p>}
+            </section>
+          )}
+
+          {showGroupProfile && selectedChat?.isGroup && (
+            <section className="popupCard" onClick={(event) => event.stopPropagation()}>
+              <div className="popupHead">
+                <h3>Group Profile</h3>
+                <button type="button" className="ghost" onClick={() => setShowGroupProfile(false)}>
+                  Close
+                </button>
+              </div>
+
+              <div className="stack">
+                <p className="muted">
+                  Your role: <strong>{roleLabel(selectedGroupRole)}</strong>
+                </p>
+                {selectedChat.parentGroupId && <p className="muted">This is a subgroup.</p>}
+              </div>
+
+              <div className="stack groupBlock">
+                <h4>Group Details</h4>
+                {canEditSelectedGroupCore ? (
+                  <>
+                    <label className="uploadLabel">
+                      Group name
+                      <input
+                        type="text"
+                        value={groupProfileNameDraft}
+                        onChange={(event) => setGroupProfileNameDraft(event.target.value)}
+                        maxLength={40}
+                      />
+                    </label>
+                    <label className="uploadLabel">
+                      Description
+                      <input
+                        type="text"
+                        value={groupDescriptionDraft}
+                        onChange={(event) => setGroupDescriptionDraft(event.target.value)}
+                        maxLength={180}
+                        placeholder="What this group is about"
+                      />
+                    </label>
+                    <div className="groupStepActions">
+                      <button type="button" onClick={saveGroupProfile}>
+                        Save Details
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <p>
+                      <strong>Name:</strong> {selectedChat.groupName || "Unnamed Group"}
+                    </p>
+                    <p>
+                      <strong>Description:</strong> {selectedChat.groupDescription || "No description yet."}
+                    </p>
+                  </>
+                )}
+              </div>
+
+              <div className="stack groupBlock">
+                <h4>Members & Roles</h4>
+                {canEditSelectedGroupCore && (
+                  <div className="groupMemberAddRow">
+                    <select
+                      value={memberToAddId}
+                      onChange={(event) => setMemberToAddId(event.target.value)}
+                      className="groupSelect"
+                    >
+                      <option value="">Select friend to add</option>
+                      {addableGroupFriends.map((friend) => (
+                        <option key={friend.id} value={friend.id}>
+                          {friend.username || friend.email || friend.id}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      onClick={() => addMemberToGroup(memberToAddId)}
+                      disabled={!memberToAddId}
+                    >
+                      Add
+                    </button>
+                  </div>
+                )}
+                <div className="groupMemberList">
+                  {selectedGroupMembers.map((member) => (
+                    <div key={member.uid} className="groupMemberCard">
+                      <div>
+                        <strong>{member.user?.username || member.user?.email || member.uid}</strong>
+                        <p className="muted">{member.user?.email || member.uid}</p>
+                      </div>
+                      <div className="groupMemberActions">
+                        {canEditSelectedGroupCore && member.uid !== selectedChat.createdBy ? (
+                          <>
+                            <select
+                              className="groupSelect"
+                              value={member.role === "creator" ? "owner" : member.role}
+                              onChange={(event) => updateGroupMemberRole(member.uid, event.target.value)}
+                            >
+                              {GROUP_ROLES.map((role) => (
+                                <option key={role} value={role}>
+                                  {roleLabel(role)}
+                                </option>
+                              ))}
+                            </select>
+                            <button
+                              type="button"
+                              className="ghost danger"
+                              onClick={() => removeMemberFromGroup(member.uid)}
+                            >
+                              Remove
+                            </button>
+                          </>
+                        ) : (
+                          <span className="rolePill">{roleLabel(member.role)}</span>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="stack groupBlock">
+                <h4>Subgroups</h4>
+                {selectedGroupSubgroups.length > 0 ? (
+                  <div className="groupSubgroupList">
+                    {selectedGroupSubgroups.map((subgroup) => (
+                      <button
+                        type="button"
+                        key={subgroup.id}
+                        className="ghost subgroupBtn"
+                        onClick={() => {
+                          openChat(subgroup.id);
+                          setShowGroupProfile(false);
+                        }}
+                      >
+                        {subgroup.groupName || "Unnamed Subgroup"}
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="muted">No subgroups yet.</p>
+                )}
+                {canManageSelectedSubgroups ? (
+                  <div className="stack">
+                    <label className="uploadLabel">
+                      New subgroup name
+                      <input
+                        type="text"
+                        value={subgroupNameDraft}
+                        onChange={(event) => setSubgroupNameDraft(event.target.value)}
+                        maxLength={40}
+                        placeholder="Design Team / Planning / QA"
+                      />
+                    </label>
+                    <p className="muted">Choose subgroup members from this group.</p>
+                    <div className="friendPickerList">
+                      {subgroupCandidateMembers.map((member) => (
+                        <button
+                          type="button"
+                          key={member.id}
+                          className={`friendPickItem ${selectedSubgroupMemberIds.includes(member.id) ? "active" : ""}`}
+                          onClick={() => toggleSubgroupMember(member.id)}
+                        >
+                          <Avatar name={member.username} photoURL={member.photoURL} />
+                          <span>{member.username || member.email || member.id}</span>
+                        </button>
+                      ))}
+                    </div>
+                    <div className="groupStepActions">
+                      <button type="button" onClick={createSubgroup}>
+                        Create Subgroup
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <p className="muted">Admins, owners, and the creator can create subgroups.</p>
+                )}
+                {subgroupStatus && <p className="muted">{subgroupStatus}</p>}
+              </div>
+
+              {groupProfileStatus && <p className="muted">{groupProfileStatus}</p>}
             </section>
           )}
 

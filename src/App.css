@@ -12,6 +12,28 @@
 
 * {
   box-sizing: border-box;
+  scrollbar-width: thin;
+  scrollbar-color: #2a2c31 #0f1012;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: #0f1012;
+  border-radius: 999px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: #2a2c31;
+  border-radius: 999px;
+  border: 2px solid #0f1012;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: #3a3d43;
 }
 
 body {
@@ -24,7 +46,8 @@ body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -56,6 +79,15 @@ button:disabled {
 }
 
 input {
+  width: 100%;
+  border: 1px solid #1a1b1e;
+  border-radius: 8px;
+  padding: 0.66rem 0.75rem;
+  background: #1e1f22;
+  color: var(--text);
+}
+
+select {
   width: 100%;
   border: 1px solid #1a1b1e;
   border-radius: 8px;
@@ -317,6 +349,7 @@ input::placeholder {
   gap: 0.6rem;
   align-items: center;
   transition: background 130ms ease, transform 130ms ease, border-color 130ms ease;
+  animation: rowEnter 180ms ease both;
 }
 
 .chatRow:hover {
@@ -360,6 +393,15 @@ input::placeholder {
   display: inline-grid;
 }
 
+.avatarWrapClickable {
+  cursor: pointer;
+  transition: transform 120ms ease;
+}
+
+.avatarWrapClickable:hover {
+  transform: scale(1.04);
+}
+
 .avatar {
   width: 36px;
   height: 36px;
@@ -389,14 +431,21 @@ input::placeholder {
 
 .chatMeta {
   display: grid;
+  min-width: 0;
 }
 
 .chatMeta strong {
   font-size: 0.95rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .chatMeta small {
   color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .chatPanel {
@@ -406,6 +455,17 @@ input::placeholder {
   grid-template-rows: auto 1fr;
   gap: 0.75rem;
   overflow: hidden;
+}
+
+.panelBody {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.75rem;
+}
+
+.panelBody.withSubgroups {
+  grid-template-columns: minmax(0, 1fr) 260px;
 }
 
 .panelTop {
@@ -437,6 +497,23 @@ input::placeholder {
   flex-wrap: wrap;
   align-items: center;
   gap: 0.45rem;
+}
+
+.groupTitleBtn {
+  background: transparent;
+  border: none;
+  color: inherit;
+  padding: 0;
+  border-radius: 0;
+  font-size: inherit;
+  font-weight: 700;
+  text-align: left;
+}
+
+.groupTitleBtn:hover {
+  color: #f2f3f5;
+  transform: none;
+  text-decoration: underline;
 }
 
 .userStatusText {
@@ -473,6 +550,66 @@ input::placeholder {
   flex-direction: column;
   min-height: 0;
   overflow: hidden;
+}
+
+.subgroupRail {
+  border-radius: 10px;
+  background: #25272b;
+  border: 1px solid #3a3d43;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  overflow: hidden;
+}
+
+.subgroupRailHead {
+  padding: 0.75rem;
+  border-bottom: 1px solid #3a3d43;
+}
+
+.subgroupRailHead h3 {
+  margin: 0;
+  font-size: 0.98rem;
+}
+
+.subgroupRailHead small {
+  color: var(--muted);
+}
+
+.subgroupList {
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  gap: 0.45rem;
+  align-content: start;
+  padding: 0.6rem;
+}
+
+.subgroupRow {
+  border-radius: 8px;
+  padding: 0.55rem;
+  text-align: left;
+  background: #2f3136;
+  color: var(--text);
+  border: 1px solid transparent;
+  display: grid;
+  grid-template-columns: 36px 1fr;
+  gap: 0.55rem;
+  align-items: center;
+}
+
+.subgroupRow:hover {
+  background: #393c43;
+}
+
+.subgroupRow.active {
+  background: #404249;
+  border-color: #5865f2;
+}
+
+.subgroupRow.mainGroup {
+  background: #34363d;
+  border-color: #4c505a;
 }
 
 .messages {
@@ -533,19 +670,21 @@ input::placeholder {
 }
 
 .bubble {
-  max-width: 80%;
+  width: min(50%, 620px);
+  max-width: 50%;
   border-radius: 12px;
-  background: #2b2d31;
-  border: 1px solid #3a3d43;
+  background: transparent;
+  border: none;
   padding: 0.55rem;
   box-shadow: none;
   position: relative;
+  animation: bubbleEnter 180ms ease both;
+  justify-self: start;
 }
 
 .bubble.own {
-  margin-left: auto;
-  background: #414675;
-  border-color: #5865f2;
+  justify-self: end;
+  background: transparent;
 }
 
 .meta {
@@ -553,7 +692,7 @@ input::placeholder {
   justify-content: space-between;
   gap: 0.5rem;
   margin-bottom: 0.2rem;
-  align-items: center;
+  align-items: flex-start;
 }
 
 .meta small {
@@ -564,6 +703,7 @@ input::placeholder {
   display: flex;
   align-items: center;
   gap: 0.4rem;
+  min-width: 0;
 }
 
 .profilePeek {
@@ -602,6 +742,35 @@ input::placeholder {
 .bubble p {
   margin: 0;
   word-break: break-word;
+}
+
+.groupedMessageStack {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.groupedMessageItem {
+  border-radius: 10px;
+  padding: 0.35rem 0.45rem;
+  border-bottom: 1px solid rgba(198, 201, 207, 0.2);
+}
+
+.messageFoot {
+  margin-top: 0.2rem;
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 0.35rem;
+  position: relative;
+  padding-right: 38px;
+}
+
+.messageTime {
+  color: #a3a6aa;
+  white-space: nowrap;
+  line-height: 1;
+  flex-shrink: 0;
+  text-align: right;
 }
 
 .composer {
@@ -713,6 +882,7 @@ input::placeholder {
   display: grid;
   place-items: center;
   padding: 1rem;
+  animation: overlayEnter 180ms ease both;
 }
 
 .popupCard {
@@ -724,6 +894,7 @@ input::placeholder {
   border: 1px solid #1f2023;
   box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
   padding: 1rem;
+  animation: popupEnter 200ms ease both;
 }
 
 .imageOverlay {
@@ -784,15 +955,18 @@ input::placeholder {
 
 .messageMenuWrap {
   position: absolute;
-  top: 0.35rem;
-  right: 0.35rem;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
   opacity: 0;
   transition: opacity 120ms ease;
+  pointer-events: none;
 }
 
-.bubble:hover .messageMenuWrap,
+.groupedMessageItem:hover .messageMenuWrap,
 .messageMenuWrap:focus-within {
   opacity: 1;
+  pointer-events: auto;
 }
 
 .menuTrigger {
@@ -980,6 +1154,70 @@ input::placeholder {
   display: flex;
   justify-content: flex-end;
   gap: 0.5rem;
+}
+
+.groupBlock {
+  margin-top: 0.8rem;
+  padding-top: 0.8rem;
+  border-top: 1px solid #3a3d43;
+}
+
+.groupBlock h4 {
+  margin: 0;
+}
+
+.groupMemberAddRow {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.55rem;
+}
+
+.groupMemberList {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.groupMemberCard {
+  background: var(--surface-muted);
+  border: 1px solid #3a3d43;
+  border-radius: 8px;
+  padding: 0.55rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.groupMemberCard p {
+  margin: 0.1rem 0 0;
+}
+
+.groupMemberActions {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.groupSelect {
+  min-width: 125px;
+}
+
+.rolePill {
+  border-radius: 999px;
+  border: 1px solid #5865f2;
+  color: #d8ddff;
+  padding: 0.18rem 0.55rem;
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+
+.groupSubgroupList {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.subgroupBtn {
+  text-align: left;
 }
 
 .requestCard {
@@ -1213,6 +1451,48 @@ input::placeholder {
   }
 }
 
+@keyframes rowEnter {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes bubbleEnter {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes overlayEnter {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes popupEnter {
+  from {
+    opacity: 0;
+    transform: scale(0.98) translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
 @keyframes eventPulseDot {
   0% {
     transform: scale(0.9);
@@ -1241,6 +1521,14 @@ input::placeholder {
 }
 
 @media (max-width: 860px) {
+  .panelBody {
+    grid-template-columns: 1fr;
+  }
+
+  .subgroupRail {
+    display: none;
+  }
+
   .appShell.mobileLayout {
     padding: 0;
     gap: 0;
