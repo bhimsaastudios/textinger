@@ -2,53 +2,70 @@
 
 Realtime Firebase chat app with:
 - Email/password auth + username registration
-- Chat sidebar + add friend flow
-- Main realtime chat panel
-- Notifications for friend requests
-- Profile panel with editable username, bio, and Cloudinary profile image upload
-- Chat media upload via Cloudinary
+- Direct chats and groups/subgroups
+- Media sending (Cloudinary)
+- Web push notifications (foreground + background + closed app)
 
 ## Setup
 
-1. Install dependencies:
+1. Install dependencies
 
 ```bash
 npm install
 ```
 
-2. Update values inside `.env`:
-- Firebase credentials (`VITE_FIREBASE_*`)
-- Firebase Web Push key:
-  - `VITE_FIREBASE_VAPID_KEY`
-- Cloudinary values for chat media:
-  - `VITE_CLOUDINARY_CLOUD_NAME`
-  - `VITE_CLOUDINARY_UPLOAD_PRESET` (unsigned preset)
+2. Add `.env` values
 
-For background notifications when the app is closed, also deploy a server-side sender (for example Firebase Cloud Functions) that sends FCM notifications to the stored `users/{uid}.fcmTokens`.
+```env
+VITE_FIREBASE_API_KEY=
+VITE_FIREBASE_AUTH_DOMAIN=
+VITE_FIREBASE_PROJECT_ID=
+VITE_FIREBASE_STORAGE_BUCKET=
+VITE_FIREBASE_MESSAGING_SENDER_ID=
+VITE_FIREBASE_APP_ID=
+VITE_FIREBASE_VAPID_KEY=
 
-## Backend Push Sender (Cloud Functions)
+VITE_CLOUDINARY_CLOUD_NAME=
+VITE_CLOUDINARY_UPLOAD_PRESET=
+```
 
-This repo now includes a Firebase Cloud Function:
-- Trigger: `chats/{chatId}/messages/{messageId}` document create
-- Function: `sendPushOnNewMessage`
-- Behavior: sends FCM web push notifications to chat recipients using tokens stored in `users/{uid}.fcmTokens`
+3. Run app
 
-### Deploy steps
+```bash
+npm run dev
+```
 
-1. Install Firebase CLI (if not installed):
+## Cloud Messaging: Why
+
+Browser local notifications only work while app page is active.  
+For real mobile/background delivery, you need:
+- Firebase Cloud Messaging (FCM) token per device
+- Service worker to receive push while app is closed/backgrounded
+- Server sender (Cloud Functions) to send push on new message
+
+## Cloud Messaging: How (Project Setup)
+
+1. Firebase Console -> Project Settings -> Cloud Messaging
+- Enable Cloud Messaging API (if prompted)
+- Generate Web Push certificate key pair
+- Copy Public key to `.env` as `VITE_FIREBASE_VAPID_KEY`
+
+2. Firebase Console -> Authentication
+- Enable Email/Password provider
+
+3. Firebase Console -> Firestore
+- Create database
+- Ensure rules allow authenticated users to update their own `users/{uid}` token field in dev/staging
+
+4. Install Firebase CLI and login
 
 ```bash
 npm install -g firebase-tools
-```
-
-2. Login and confirm project:
-
-```bash
 firebase login
 firebase use textinger-daf47
 ```
 
-3. Install function dependencies:
+5. Install functions dependencies
 
 ```bash
 cd functions
@@ -56,51 +73,46 @@ npm install
 cd ..
 ```
 
-4. Deploy the function:
+6. Deploy
 
 ```bash
 firebase deploy --only functions
+firebase deploy --only hosting
 ```
 
-After deploy, new messages will trigger push notifications (including when app is closed), as long as recipient users have valid `fcmTokens`.
+## Mobile Push (Important)
 
-3. Start development server:
+For reliable mobile push:
+- Use deployed HTTPS URL (not local network HTTP)
+- Install app from Chrome menu: `Add to Home screen`
+- Grant notification permission
+- Open app once after deploy so token is refreshed
+- Disable aggressive battery optimization for Chrome/PWA if device blocks background network
 
-```bash
-npm run dev
-```
+This project includes:
+- `public/firebase-messaging-sw.js` for background push handling
+- `public/manifest.webmanifest` for installable mobile web app behavior
+- Cloud Function trigger at `chats/{chatId}/messages/{messageId}` to send push to `users/{uid}.fcmTokens`
 
-## Firestore Rules (development only)
+## Quick Push Test
 
-```txt
-rules_version = '2';
-service cloud.firestore {
-  match /databases/{database}/documents {
-    match /users/{userId} {
-      allow read, write: if request.auth != null;
-    }
+1. Login as User A and enable push in app.
+2. Verify Firestore `users/{A_UID}.fcmTokens` has a token.
+3. Login as User B and send message to User A.
+4. Put User A app in background/close app.
+5. User A should receive push notification.
 
-    match /users/{userId}/savedMessages/{savedId} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
-    }
+## Troubleshooting
 
-    match /friendRequests/{requestId} {
-      allow read, write: if request.auth != null;
-    }
+- No token in Firestore:
+  - `VITE_FIREBASE_VAPID_KEY` missing/wrong
+  - notification permission denied
+  - service worker not registered
 
-    match /chats/{chatId} {
-      allow read, write: if request.auth != null;
+- Push not delivered:
+  - functions not deployed
+  - stale tokens (invalid token errors in function logs)
+  - app tested on non-HTTPS URL
 
-      match /messages/{messageId} {
-        allow read, write: if request.auth != null;
-      }
-
-      match /typing/{typingId} {
-        allow read, write: if request.auth != null;
-      }
-    }
-  }
-}
-```
-
-For production, tighten Firestore rules with stricter ownership and validation checks.
+- Foreground push missing:
+  - verify `onMessage` path and that permission is granted

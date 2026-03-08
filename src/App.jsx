@@ -820,6 +820,10 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    registerMessagingServiceWorker().catch(() => {});
+  }, []);
+
+  useEffect(() => {
     if (!currentUser) {
       setFcmStatus("");
       return;
@@ -835,8 +839,8 @@ export default function App() {
       .then((messaging) => {
         if (!messaging) return;
         unsub = onMessage(messaging, (payload) => {
-          const title = payload.notification?.title || "Textinger";
-          const body = payload.notification?.body || "You have a new notification.";
+          const title = payload.notification?.title || payload.data?.title || "Textinger";
+          const body = payload.notification?.body || payload.data?.body || "You have a new notification.";
           pushBrowserNotification(title, body);
         });
       })
