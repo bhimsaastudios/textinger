@@ -6,8 +6,6 @@ admin.initializeApp();
 const db = admin.firestore();
 
 const MAX_NOTIFICATION_BODY = 140;
-const ONE_SIGNAL_APP_ID = process.env.ONESIGNAL_APP_ID || "";
-const ONE_SIGNAL_API_KEY = process.env.ONESIGNAL_REST_API_KEY || "";
 
 function buildMessagePreview(message) {
   const text = (message.text || "").trim();
@@ -30,46 +28,6 @@ function isInvalidFcmTokenError(code) {
     code === "messaging/invalid-registration-token" ||
     code === "messaging/registration-token-not-registered"
   );
-}
-
-async function sendOneSignalPush({ recipientIds, title, body, chatId, senderId, senderName }) {
-  if (!ONE_SIGNAL_APP_ID || !ONE_SIGNAL_API_KEY) return false;
-  if (!Array.isArray(recipientIds) || recipientIds.length === 0) return false;
-
-  const response = await fetch("https://api.onesignal.com/notifications?c=push", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json; charset=utf-8",
-      Authorization: `Key ${ONE_SIGNAL_API_KEY}`,
-    },
-    body: JSON.stringify({
-      app_id: ONE_SIGNAL_APP_ID,
-      include_aliases: { external_id: recipientIds },
-      target_channel: "push",
-      headings: { en: title },
-      contents: { en: body },
-      data: {
-        chatId,
-        senderId,
-        senderName,
-        link: "/",
-      },
-    }),
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => "");
-    logger.error("OneSignal push failed.", { status: response.status, errorText });
-    return false;
-  }
-
-  const payload = await response.json().catch(() => ({}));
-  const recipients = Number(payload?.recipients || 0);
-  if (recipients <= 0) {
-    logger.warn("OneSignal accepted request but delivered to 0 recipients.", { payload });
-    return false;
-  }
-  return true;
 }
 
 exports.sendPushOnNewMessage = onDocumentCreated(
@@ -115,25 +73,9 @@ exports.sendPushOnNewMessage = onDocumentCreated(
     const title = isGroup ? chat.groupName || "Group Chat" : senderName;
     const body = isGroup ? `${senderName}: ${preview}` : preview;
 
-    const oneSignalSent = await sendOneSignalPush({
-      recipientIds,
-      title,
-      body,
-      chatId,
-      senderId,
-      senderName,
-    });
-    if (oneSignalSent) {
-      logger.info("OneSignal push sent.", {
-        chatId,
-        recipients: recipientIds.length,
-      });
-      return;
-    }
-
     const tokens = Array.from(tokenOwners.keys());
     if (tokens.length === 0) {
-      logger.warn("No valid FCM tokens and OneSignal push not delivered.", {
+      logger.warn("No valid FCM tokens available for recipients.", {
         chatId,
         recipients: recipientIds.length,
       });
