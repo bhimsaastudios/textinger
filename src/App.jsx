@@ -375,6 +375,7 @@ export default function App() {
     return Notification.permission;
   });
   const [fcmStatus, setFcmStatus] = useState("");
+  const [oneSignalStatus, setOneSignalStatus] = useState("");
   const [blockedUserIds, setBlockedUserIds] = useState([]);
   const [mutedUserIds, setMutedUserIds] = useState([]);
   const [chatLocks, setChatLocks] = useState({});
@@ -783,6 +784,31 @@ export default function App() {
     }
   }
 
+  async function enableOneSignalPushForCurrentUser() {
+    if (typeof window === "undefined") return;
+    if (!currentUser) {
+      setOneSignalStatus("Sign in first, then enable OneSignal.");
+      return;
+    }
+    if (!window.OneSignalDeferred) {
+      setOneSignalStatus("OneSignal SDK is not loaded.");
+      return;
+    }
+    try {
+      window.OneSignalDeferred.push(async (OneSignal) => {
+        await OneSignal.login(currentUser.uid);
+        const granted = await OneSignal.Notifications.requestPermission();
+        if (!granted) {
+          setOneSignalStatus("OneSignal permission denied.");
+          return;
+        }
+        setOneSignalStatus("OneSignal push enabled.");
+      });
+    } catch {
+      setOneSignalStatus("Failed to enable OneSignal.");
+    }
+  }
+
   function handleListenerError(error) {
     if (isPermissionDenied(error)) {
       setAuthError("Access blocked by Firestore rules. Update your Firestore rules and try again.");
@@ -826,11 +852,23 @@ export default function App() {
   useEffect(() => {
     if (!currentUser) {
       setFcmStatus("");
+      setOneSignalStatus("");
       return;
     }
     if (notificationPermission !== "granted") return;
     enablePushNotificationsForCurrentUser().catch(() => {});
   }, [currentUser, notificationPermission]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !currentUser || !window.OneSignalDeferred) return;
+    window.OneSignalDeferred.push(async (OneSignal) => {
+      try {
+        await OneSignal.login(currentUser.uid);
+      } catch {
+        // ignore OneSignal login failures for now
+      }
+    });
+  }, [currentUser]);
 
   useEffect(() => {
     if (notificationPermission !== "granted") return undefined;
@@ -3083,11 +3121,15 @@ export default function App() {
                 <p className="muted">
                   Cloud messaging: {notificationPermission === "granted" ? "Access is granted" : fcmStatus || "not configured"}
                 </p>
+                <p className="muted">OneSignal: {oneSignalStatus || "not configured"}</p>
                 {notificationPermission !== "granted" && (
                   <button type="button" className="ghost" onClick={requestNotificationPermission}>
                     Enable Push Notifications
                   </button>
                 )}
+                <button type="button" className="ghost" onClick={enableOneSignalPushForCurrentUser}>
+                  Enable OneSignal Push
+                </button>
               </div>
               {requests.length === 0 && <p className="muted">No pending requests.</p>}
               <div className="requestList">

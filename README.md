@@ -29,6 +29,13 @@ VITE_CLOUDINARY_CLOUD_NAME=
 VITE_CLOUDINARY_UPLOAD_PRESET=
 ```
 
+Optional (OneSignal for background/closed-app push):
+
+```env
+ONESIGNAL_APP_ID=12b1d457-a36e-41e7-9c07-8428ef2d3438
+ONESIGNAL_REST_API_KEY=your_onesignal_rest_api_key
+```
+
 3. Run app
 
 ```bash
@@ -79,6 +86,8 @@ cd ..
 firebase deploy --only functions
 firebase deploy --only hosting
 ```
+
+If you use OneSignal server sending, set function secrets/env before deploying functions.
 
 ## Mobile Push (Important)
 
