@@ -41,6 +41,8 @@ const MESSAGE_RATE_LIMIT = 3;
 const MESSAGE_RATE_WINDOW_MS = 1000;
 const CHAT_PREVIEW_MAX_LENGTH = 72;
 const GROUP_ROLES = ["member", "editor", "admin", "owner"];
+const ONE_SIGNAL_APP_ID = import.meta.env.VITE_ONESIGNAL_APP_ID || "";
+const ONE_SIGNAL_NOTIFY_URL = import.meta.env.VITE_ONESIGNAL_NOTIFY_URL || "";
 
 function formatTime(value) {
   if (!value) return "";
@@ -401,6 +403,8 @@ export default function App() {
   const eventProcessingRef = useRef(new Set());
   const presenceHeartbeatRef = useRef(null);
   const messageSendTimesRef = useRef([]);
+  const oneSignalReadyRef = useRef(false);
+  const oneSignalScriptLoadingRef = useRef(null);
 
   const usersById = useMemo(() => {
     const map = new Map();
@@ -717,6 +721,76 @@ export default function App() {
     }
   }
 
+  async function ensureOneSignalLoaded() {
+    if (typeof window === "undefined" || !ONE_SIGNAL_APP_ID) return null;
+    if (window.OneSignal) return window.OneSignal;
+    if (oneSignalScriptLoadingRef.current) {
+      await oneSignalScriptLoadingRef.current;
+      return window.OneSignal || null;
+    }
+
+    oneSignalScriptLoadingRef.current = new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = "https://cdn.onesignal.com/sdks/web/v16/OneSignalSDK.page.js";
+      script.defer = true;
+      script.onload = () => resolve();
+      script.onerror = () => reject(new Error("OneSignal SDK failed to load."));
+      document.head.appendChild(script);
+    });
+
+    try {
+      await oneSignalScriptLoadingRef.current;
+      return window.OneSignal || null;
+    } finally {
+      oneSignalScriptLoadingRef.current = null;
+    }
+  }
+
+  async function initOneSignalForCurrentUser() {
+    if (!currentUser || !ONE_SIGNAL_APP_ID || typeof window === "undefined") return false;
+    const OneSignal = await ensureOneSignalLoaded();
+    if (!OneSignal) return false;
+
+    if (!oneSignalReadyRef.current) {
+      await OneSignal.init({
+        appId: ONE_SIGNAL_APP_ID,
+        serviceWorkerPath: "/OneSignalSDKWorker.js",
+        serviceWorkerUpdaterPath: "/OneSignalSDKUpdaterWorker.js",
+        notifyButton: { enable: false },
+      });
+      oneSignalReadyRef.current = true;
+    }
+
+    await OneSignal.login(currentUser.uid);
+    await setDoc(
+      doc(db, "users", currentUser.uid),
+      {
+        oneSignalExternalId: currentUser.uid,
+        oneSignalLinkedAt: serverTimestamp(),
+      },
+      { merge: true },
+    );
+    return true;
+  }
+
+  async function sendClosedAppNotification(recipientIds, title, body, chatId) {
+    if (!ONE_SIGNAL_NOTIFY_URL || !Array.isArray(recipientIds) || recipientIds.length === 0) return;
+    try {
+      await fetch(ONE_SIGNAL_NOTIFY_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          recipientIds,
+          title: title || "Textinger",
+          body: body || "You have a new message.",
+          chatId: chatId || "",
+        }),
+      });
+    } catch {
+      // OneSignal relay is best-effort and should not block messaging.
+    }
+  }
+
   async function registerMessagingServiceWorker() {
     if (typeof window === "undefined" || !("serviceWorker" in navigator)) return null;
     return navigator.serviceWorker.register("/firebase-messaging-sw.js");
@@ -760,6 +834,7 @@ export default function App() {
       },
       { merge: true },
     );
+    await initOneSignalForCurrentUser().catch(() => false);
     setFcmStatus("Push notifications enabled on this device.");
   }
 
@@ -777,6 +852,10 @@ export default function App() {
         return;
       }
       await enablePushNotificationsForCurrentUser();
+      const oneSignalReady = await initOneSignalForCurrentUser().catch(() => false);
+      if (oneSignalReady && window.OneSignal?.Notifications?.permission !== "granted") {
+        await window.OneSignal.Notifications.requestPermission();
+      }
     } catch {
       setNotificationPermission(Notification.permission);
       setFcmStatus("Failed to enable push notifications.");
@@ -825,6 +904,9 @@ export default function App() {
 
   useEffect(() => {
     if (!currentUser) {
+      if (window.OneSignal && oneSignalReadyRef.current) {
+        window.OneSignal.logout().catch(() => {});
+      }
       setFcmStatus("");
       return;
     }
@@ -1629,6 +1711,16 @@ export default function App() {
       lastSenderId: payload.senderId || currentUser.uid,
       updatedAt: serverTimestamp(),
     });
+
+    const recipientIds = (selectedChat.members || [])
+      .filter((uid) => uid && uid !== currentUser.uid)
+      .filter((uid) => !isUserOnline(usersById.get(uid)));
+    if (recipientIds.length > 0) {
+      const title = selectedChat.isGroup
+        ? `${selectedChat.groupName || "Group"}`
+        : username;
+      await sendClosedAppNotification(recipientIds, title, lastMessage, selectedChat.id);
+    }
   }
 
   async function sendMessage(event) {

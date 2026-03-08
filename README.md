@@ -4,7 +4,7 @@ Realtime Firebase chat app with:
 - Email/password auth + username registration
 - Direct chats and groups/subgroups
 - Media sending (Cloudinary)
-- Web push notifications (foreground + background + closed app)
+- Firebase notifications for open app + OneSignal for closed/background app
 
 ## Setup
 
@@ -27,6 +27,8 @@ VITE_FIREBASE_VAPID_KEY=
 
 VITE_CLOUDINARY_CLOUD_NAME=
 VITE_CLOUDINARY_UPLOAD_PRESET=
+VITE_ONESIGNAL_APP_ID=
+VITE_ONESIGNAL_NOTIFY_URL=
 ```
 
 3. Run app
@@ -57,12 +59,11 @@ For real mobile/background delivery, you need:
 - Create database
 - Ensure rules allow authenticated users to update their own `users/{uid}` token field in dev/staging
 
-4. Install Firebase CLI and login
+4. Login to Firebase CLI
 
 ```bash
-npm install -g firebase-tools
-firebase login
-firebase use textinger-daf47
+npx firebase-tools login
+npx firebase-tools use textinger-daf47
 ```
 
 5. Install functions dependencies
@@ -73,11 +74,12 @@ npm install
 cd ..
 ```
 
-6. Deploy
+6. Build + Deploy
 
 ```bash
-firebase deploy --only functions
-firebase deploy --only hosting
+npm run build
+npx firebase-tools deploy --only functions
+npx firebase-tools deploy --only hosting
 ```
 
 ## Mobile Push (Important)
@@ -93,6 +95,28 @@ This project includes:
 - `public/firebase-messaging-sw.js` for background push handling
 - `public/manifest.webmanifest` for installable mobile web app behavior
 - Cloud Function trigger at `chats/{chatId}/messages/{messageId}` to send push to `users/{uid}.fcmTokens`
+
+## Free Closed-App Push (No Blaze): OneSignal + Cloudflare Worker
+
+Use this path if you don't want to upgrade Firebase to Blaze:
+
+1. OneSignal setup
+- Create OneSignal app (Web Push)
+- Add your domain (`https://textinger-daf47.web.app`)
+- Copy OneSignal App ID to `.env` as `VITE_ONESIGNAL_APP_ID`
+
+2. Cloudflare Worker setup
+- Create a Worker and paste code from `cloudflare/worker.js`
+- Add Worker environment variables:
+  - `ONESIGNAL_APP_ID` (same OneSignal app id)
+  - `ONESIGNAL_REST_API_KEY` (OneSignal REST API key)
+- Deploy Worker and copy the Worker URL
+- Put Worker URL in `.env` as `VITE_ONESIGNAL_NOTIFY_URL`
+
+3. App behavior
+- Firebase handles in-app/open notifications
+- OneSignal is called only for offline recipients (closed/background users)
+- Users are mapped in OneSignal using Firebase UID as `external_id`
 
 ## Quick Push Test
 

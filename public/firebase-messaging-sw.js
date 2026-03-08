@@ -7,6 +7,7 @@ self.addEventListener("push", (event) => {
   } catch {
     payload = {};
   }
+  if (payload?.notification?.title || payload?.notification?.body) return;
 
   const data = payload?.data || {};
   const title = data.title || payload?.notification?.title || "Textinger";
