@@ -78,7 +78,6 @@ exports.sendPushOnNewMessage = onDocumentCreated(
 
     const response = await admin.messaging().sendEachForMulticast({
       tokens,
-      notification: { title, body },
       data: {
         chatId,
         senderId,
@@ -87,16 +86,14 @@ exports.sendPushOnNewMessage = onDocumentCreated(
         title,
         body,
         link: "/",
+        icon: "/app-logo.png",
+        badge: "/app-logo.png",
+        tag: `chat-${chatId}`,
       },
       webpush: {
         headers: {
           Urgency: "high",
           TTL: "2419200",
-        },
-        notification: {
-          icon: "/app-logo.png",
-          badge: "/app-logo.png",
-          tag: `chat-${chatId}`,
         },
         fcmOptions: {
           link: "/",
