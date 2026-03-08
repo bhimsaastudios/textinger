@@ -711,14 +711,30 @@ export default function App() {
 
   function pushBrowserNotification(title, body) {
     if (typeof window === "undefined" || typeof Notification === "undefined") return;
-    if (document.visibilityState === "visible") return;
     if (Notification.permission !== "granted") return;
+    const isVisible = document.visibilityState === "visible";
+    const isMobileDevice = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || "");
+    if (isVisible && !isMobileDevice) return;
+    if (isMobileDevice && "serviceWorker" in navigator) {
+      navigator.serviceWorker
+        .getRegistration()
+        .then((registration) =>
+          registration?.showNotification(title, {
+            body,
+            icon: "/app-logo.png",
+            badge: "/app-logo.png",
+            tag: "textinger-mobile-alert",
+            renotify: true,
+            data: { link: "/" },
+          }),
+        )
+        .catch(() => {});
+      return;
+    }
     try {
       const notification = new Notification(title, { body });
       setTimeout(() => notification.close(), 6000);
-    } catch {
-      // ignore browser notification errors
-    }
+    } catch {}
   }
 
   async function ensureOneSignalLoaded() {
@@ -1714,7 +1730,11 @@ export default function App() {
 
     const recipientIds = (selectedChat.members || [])
       .filter((uid) => uid && uid !== currentUser.uid)
-      .filter((uid) => !isUserOnline(usersById.get(uid)));
+      .filter((uid) => {
+        const recipient = usersById.get(uid);
+        if (!recipient) return true;
+        return recipient.isOnline !== true;
+      });
     if (recipientIds.length > 0) {
       const title = selectedChat.isGroup
         ? `${selectedChat.groupName || "Group"}`
