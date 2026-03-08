@@ -347,6 +347,7 @@ export default function App() {
   const [eventStatus, setEventStatus] = useState("");
   const [eventPulseChatIds, setEventPulseChatIds] = useState([]);
   const [eventToast, setEventToast] = useState(null);
+  const [mobileMessageToast, setMobileMessageToast] = useState(null);
   const [activeEventDisplay, setActiveEventDisplay] = useState(null);
   const [viewedUserId, setViewedUserId] = useState("");
   const [groupStep, setGroupStep] = useState("select");
@@ -394,6 +395,7 @@ export default function App() {
   const nearBottomRef = useRef(true);
   const lastScrollChatIdRef = useRef("");
   const lastMessageCountRef = useRef(0);
+  const forceScrollToBottomRef = useRef(false);
   const typingTextRef = useRef("");
   const chatsInitRef = useRef(false);
   const chatMetaRef = useRef(new Map());
@@ -1089,6 +1091,22 @@ export default function App() {
   }, [isMobileLayout, selectedChatId]);
 
   useEffect(() => {
+    if (!isMobileLayout || mobileScreen !== "chat") return;
+    forceScrollToBottomRef.current = true;
+    const attemptScroll = () => {
+      const target = messagesRef.current;
+      if (!target) return;
+      target.scrollTop = target.scrollHeight;
+      nearBottomRef.current = true;
+    };
+    requestAnimationFrame(() => {
+      requestAnimationFrame(attemptScroll);
+    });
+    const timer = setTimeout(attemptScroll, 140);
+    return () => clearTimeout(timer);
+  }, [isMobileLayout, mobileScreen, selectedChatId]);
+
+  useEffect(() => {
     if (!isMobileLayout) {
       setMobileSubgroupsOpen(false);
     }
@@ -1101,6 +1119,7 @@ export default function App() {
     setRecoveryAnswerDraft("");
     setNewPinDraft("");
     setReplyingTo(null);
+    forceScrollToBottomRef.current = true;
   }, [selectedChatId]);
 
   useEffect(() => {
@@ -1121,14 +1140,23 @@ export default function App() {
 
   useEffect(() => {
     if (!selectedChatId || !messagesRef.current) return;
-    if (lastScrollChatIdRef.current !== selectedChatId) {
+    if (lastScrollChatIdRef.current !== selectedChatId || forceScrollToBottomRef.current) {
       const target = messagesRef.current;
       requestAnimationFrame(() => {
-        target.scrollTop = target.scrollHeight;
-        nearBottomRef.current = true;
+        requestAnimationFrame(() => {
+          target.scrollTop = target.scrollHeight;
+          nearBottomRef.current = true;
+        });
       });
+      setTimeout(() => {
+        if (messagesRef.current) {
+          messagesRef.current.scrollTop = messagesRef.current.scrollHeight;
+          nearBottomRef.current = true;
+        }
+      }, 110);
       lastScrollChatIdRef.current = selectedChatId;
       lastMessageCountRef.current = messages.length;
+      forceScrollToBottomRef.current = false;
       return;
     }
 
@@ -1312,10 +1340,9 @@ export default function App() {
         currentMeta.updatedAt !== prev.updatedAt || currentMeta.lastMessage !== prev.lastMessage;
       if (!changed) continue;
       if (!currentMeta.lastSenderId || currentMeta.lastSenderId === currentUser.uid) continue;
+      if (chat.id === selectedChatId) continue;
 
-      if (chat.id !== selectedChatId) {
-        setUnreadChatIds((prev) => (prev.includes(chat.id) ? prev : [...prev, chat.id]));
-      }
+      setUnreadChatIds((prev) => (prev.includes(chat.id) ? prev : [...prev, chat.id]));
 
       const otherUid = (chat.members || []).find((member) => member !== currentUser.uid);
       if (!chat.isGroup && otherUid && blockedUserIds.includes(otherUid)) continue;
@@ -1324,11 +1351,33 @@ export default function App() {
       const chatTitle = chat.isGroup
         ? chat.groupName || "Group Chat"
         : other?.username || "New Message";
+      if (isMobileLayout && document.visibilityState === "visible") {
+        setMobileMessageToast({
+          chatId: chat.id,
+          title: chatTitle,
+          text: truncateText(currentMeta.lastMessage || "You have a new message.", 80),
+        });
+      }
       pushBrowserNotification(chatTitle, currentMeta.lastMessage || "You have a new message.");
     }
 
     chatMetaRef.current = nextMap;
-  }, [chats, currentUser, usersById, selectedChatId, blockedUserIds, mutedUserIds]);
+  }, [chats, currentUser, usersById, selectedChatId, blockedUserIds, mutedUserIds, isMobileLayout]);
+
+  useEffect(() => {
+    if (!mobileMessageToast) return undefined;
+    const timer = setTimeout(() => {
+      setMobileMessageToast((prev) => (prev?.chatId === mobileMessageToast.chatId ? null : prev));
+    }, 6000);
+    return () => clearTimeout(timer);
+  }, [mobileMessageToast]);
+
+  useEffect(() => {
+    if (!mobileMessageToast) return;
+    if (selectedChatId === mobileMessageToast.chatId) {
+      setMobileMessageToast(null);
+    }
+  }, [selectedChatId, mobileMessageToast]);
 
   useEffect(() => {
     if (!selectedChatId) return;
@@ -2578,11 +2627,44 @@ export default function App() {
                   {selectedChat.groupName || "Unnamed Group"}
                 </button>
               ) : (
-                selectedChatOtherUser?.username || "Textinger"
+                <span className="panelNameChip">{selectedChatOtherUser?.username || "Textinger"}</span>
               )}
               {!selectedChat?.isGroup && (
                 <span className={`userStatusText ${isSelectedUserOnline ? "online" : "offline"}`}>
                   {isSelectedUserOnline ? "Online" : "Offline"}
+                </span>
+              )}
+              {isMobileLayout && (
+                <span className="mobileInlineActions">
+                  <button
+                    type="button"
+                    className="ghost mobileIconBtn"
+                    onClick={openNotificationPopup}
+                    title="Notifications"
+                    aria-label="Notifications"
+                  >
+                    !
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost mobileIconBtn"
+                    onClick={openProfilePopup}
+                    title="Profile"
+                    aria-label="Profile"
+                  >
+                    @
+                  </button>
+                  {selectedChat?.isGroup && (
+                    <button
+                      type="button"
+                      className="ghost mobileIconBtn"
+                      onClick={() => setMobileSubgroupsOpen((prev) => !prev)}
+                      title="Subgroups"
+                      aria-label="Subgroups"
+                    >
+                      {mobileSubgroupsOpen ? ">" : "<"}
+                    </button>
+                  )}
                 </span>
               )}
             </h1>
@@ -2596,20 +2678,15 @@ export default function App() {
             </div>
           </div>
           <div className="topActions">
-            <button type="button" onClick={openNotificationPopup}>
-              Notifications {requests.length > 0 ? `(${requests.length})` : ""}
-            </button>
-            <button type="button" onClick={openProfilePopup}>
-              Profile
-            </button>
-            {isMobileLayout && selectedChat?.isGroup && (
-              <button
-                type="button"
-                className="ghost mobileSubgroupToggle"
-                onClick={() => setMobileSubgroupsOpen((prev) => !prev)}
-              >
-                {mobileSubgroupsOpen ? "→" : "←"}
-              </button>
+            {!isMobileLayout && (
+              <>
+                <button type="button" onClick={openNotificationPopup}>
+                  Notifications {requests.length > 0 ? `(${requests.length})` : ""}
+                </button>
+                <button type="button" onClick={openProfilePopup}>
+                  Profile
+                </button>
+              </>
             )}
           </div>
         </header>
@@ -3751,6 +3828,21 @@ export default function App() {
           <p>{eventToast.text}</p>
         </div>
       )}
+
+      {isMobileLayout && mobileMessageToast && (
+        <button
+          type="button"
+          className="mobileMessageToast"
+          onClick={() => {
+            openChat(mobileMessageToast.chatId);
+            setMobileMessageToast(null);
+          }}
+        >
+          <strong>{mobileMessageToast.title}</strong>
+          <p>{mobileMessageToast.text}</p>
+        </button>
+      )}
     </>
   );
 }
+
