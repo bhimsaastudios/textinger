@@ -62,6 +62,23 @@ function truncateText(value, maxLength = CHAT_PREVIEW_MAX_LENGTH) {
   return text.length > maxLength ? `${text.slice(0, Math.max(0, maxLength - 3))}...` : text;
 }
 
+function renderTextWithLinks(value) {
+  const text = `${value || ""}`;
+  if (!text) return "";
+  const linkPattern = /((https?:\/\/|www\.)[^\s]+)/gi;
+  const parts = text.split(linkPattern);
+  return parts.map((part, index) => {
+    const isLink = /^(https?:\/\/|www\.)[^\s]+$/i.test(part);
+    if (!isLink) return <span key={`text_${index}`}>{part}</span>;
+    const href = /^https?:\/\//i.test(part) ? part : `https://${part}`;
+    return (
+      <a key={`link_${index}`} href={href} target="_blank" rel="noreferrer" className="textLink">
+        {part}
+      </a>
+    );
+  });
+}
+
 function getGroupRole(chat, uid) {
   if (!chat?.isGroup || !uid) return "member";
   if (chat.createdBy === uid) return "creator";
@@ -92,6 +109,21 @@ function canDeleteGroupMessage(chat, message, uid) {
 function roleLabel(role) {
   if (role === "creator") return "Creator";
   return role.charAt(0).toUpperCase() + role.slice(1);
+}
+
+function getChatLockConfig(chatLocks, chatId) {
+  const raw = chatLocks?.[chatId];
+  if (!raw) return null;
+  if (typeof raw === "string") {
+    return { pin: raw, recoveryAnswer: "" };
+  }
+  if (typeof raw === "object") {
+    return {
+      pin: `${raw.pin || ""}`.trim(),
+      recoveryAnswer: `${raw.recoveryAnswer || ""}`.trim().toLowerCase(),
+    };
+  }
+  return null;
 }
 
 function normalizeAuthError(error) {
@@ -282,6 +314,7 @@ export default function App() {
 
   const [text, setText] = useState("");
   const [mediaFile, setMediaFile] = useState(null);
+  const [mediaPreviewURL, setMediaPreviewURL] = useState("");
   const [attachMenuOpen, setAttachMenuOpen] = useState(false);
   const [sending, setSending] = useState(false);
   const [busyLabel, setBusyLabel] = useState("");
@@ -329,6 +362,7 @@ export default function App() {
   const [selectedSubgroupMemberIds, setSelectedSubgroupMemberIds] = useState([]);
   const [savedStatus, setSavedStatus] = useState("");
   const [composerStatus, setComposerStatus] = useState("");
+  const [replyingTo, setReplyingTo] = useState(null);
   const [showSpamWarning, setShowSpamWarning] = useState(false);
   const [isMobileLayout, setIsMobileLayout] = useState(() => {
     if (typeof window === "undefined") return false;
@@ -341,8 +375,23 @@ export default function App() {
     return Notification.permission;
   });
   const [fcmStatus, setFcmStatus] = useState("");
+  const [blockedUserIds, setBlockedUserIds] = useState([]);
+  const [mutedUserIds, setMutedUserIds] = useState([]);
+  const [chatLocks, setChatLocks] = useState({});
+  const [unlockedChatIds, setUnlockedChatIds] = useState([]);
+  const [unlockPinDraft, setUnlockPinDraft] = useState("");
+  const [unlockStatus, setUnlockStatus] = useState("");
+  const [showRecovery, setShowRecovery] = useState(false);
+  const [recoveryAnswerDraft, setRecoveryAnswerDraft] = useState("");
+  const [newPinDraft, setNewPinDraft] = useState("");
   const mediaInputRef = useRef(null);
   const documentInputRef = useRef(null);
+  const cameraInputRef = useRef(null);
+  const composerFormRef = useRef(null);
+  const messagesRef = useRef(null);
+  const nearBottomRef = useRef(true);
+  const lastScrollChatIdRef = useRef("");
+  const lastMessageCountRef = useRef(0);
   const typingTextRef = useRef("");
   const chatsInitRef = useRef(false);
   const chatMetaRef = useRef(new Map());
@@ -369,6 +418,10 @@ export default function App() {
     const uid = (selectedChat.members || []).find((member) => member !== currentUser.uid);
     return uid ? usersById.get(uid) : null;
   }, [selectedChat, currentUser, usersById]);
+  const selectedChatIsLocked = useMemo(
+    () => Boolean(selectedChatId && getChatLockConfig(chatLocks, selectedChatId) && !unlockedChatIds.includes(selectedChatId)),
+    [selectedChatId, chatLocks, unlockedChatIds],
+  );
   const selectedGroupRole = useMemo(
     () => getGroupRole(selectedChat, currentUser?.uid),
     [selectedChat, currentUser],
@@ -395,8 +448,14 @@ export default function App() {
     return chats.find((chat) => chat.id === activeGroupRootId) || null;
   }, [activeGroupRootId, selectedChat, chats]);
   const mainChatList = useMemo(
-    () => chats.filter((chat) => !chat.isSubgroup),
-    [chats],
+    () =>
+      chats.filter((chat) => {
+        if (chat.isSubgroup) return false;
+        if (chat.isGroup) return true;
+        const otherId = (chat.members || []).find((id) => id !== currentUser?.uid);
+        return otherId ? !blockedUserIds.includes(otherId) : true;
+      }),
+    [chats, currentUser, blockedUserIds],
   );
   const subgroupNavItems = useMemo(() => {
     if (!activeGroupRoot) return [];
@@ -444,9 +503,15 @@ export default function App() {
       .filter(Boolean);
   }, [selectedChat, usersById, currentUser]);
   const savedMessageIds = useMemo(() => new Set(savedMessages.map((item) => item.id)), [savedMessages]);
+  const visibleMessages = useMemo(() => {
+    if (!selectedChat || selectedChat.isGroup || !currentUser) return messages;
+    const otherId = (selectedChat.members || []).find((id) => id !== currentUser.uid);
+    if (!otherId || !blockedUserIds.includes(otherId)) return messages;
+    return messages.filter((item) => item.senderId === currentUser.uid);
+  }, [messages, selectedChat, currentUser, blockedUserIds]);
   const groupedMessages = useMemo(() => {
     const groups = [];
-    for (const message of messages) {
+    for (const message of visibleMessages) {
       const prev = groups[groups.length - 1];
       if (prev && prev.senderId === message.senderId) {
         prev.items.push(message);
@@ -459,10 +524,15 @@ export default function App() {
       }
     }
     return groups;
-  }, [messages]);
+  }, [visibleMessages]);
 
   function buildSavedId(chatId, messageId) {
     return `${chatId}_${messageId}`;
+  }
+
+  function getSessionKey(name) {
+    const uid = currentUser?.uid || "guest";
+    return `textinger_${name}_${uid}`;
   }
 
   function handleComposerFileSelect(file) {
@@ -497,6 +567,52 @@ export default function App() {
     setSelectedChatId(chatId);
     if (isMobileLayout) setMobileScreen("chat");
     setMobileSubgroupsOpen(false);
+  }
+
+  function handleComposerKeyDown(event) {
+    if (event.key !== "Enter") return;
+    if (isMobileLayout) return;
+    if (event.shiftKey) return;
+    event.preventDefault();
+    composerFormRef.current?.requestSubmit();
+  }
+
+  function beginReplyToMessage(message) {
+    if (!message) return;
+    const senderUser = usersById.get(message.senderId);
+    const senderName =
+      message.senderId === currentUser?.uid
+        ? username
+        : senderUser?.username || message.senderName || message.user || "User";
+    const preview =
+      truncateText((message.text || "").trim(), 80) ||
+      (message.mediaType?.startsWith("image/")
+        ? "Photo"
+        : message.mediaType?.startsWith("video/")
+          ? "Video"
+          : message.mediaType?.startsWith("audio/")
+            ? "Audio"
+            : message.mediaURL
+              ? "File"
+              : "Message");
+    setReplyingTo({
+      id: message.id,
+      senderId: message.senderId || "",
+      senderName,
+      text: preview,
+    });
+    setOpenMessageMenuId("");
+  }
+
+  function attachReplyMetadata(payload) {
+    if (!replyingTo?.id) return payload;
+    return {
+      ...payload,
+      replyToMessageId: replyingTo.id,
+      replyToSenderId: replyingTo.senderId || "",
+      replyToSenderName: replyingTo.senderName || "User",
+      replyToText: replyingTo.text || "",
+    };
   }
 
   function openAddFriendPopup() {
@@ -852,12 +968,27 @@ export default function App() {
   }, [currentUser]);
 
   useEffect(() => {
-    if (!selectedChatId && chats.length > 0) setSelectedChatId(chats[0].id);
+    if (!selectedChatId && chats.length > 0) {
+      const storedId =
+        typeof window !== "undefined" && currentUser
+          ? localStorage.getItem(getSessionKey("last_chat"))
+          : "";
+      if (storedId && chats.some((chat) => chat.id === storedId)) {
+        setSelectedChatId(storedId);
+      } else {
+        setSelectedChatId(chats[0].id);
+      }
+    }
     if (chats.length === 0) {
       setSelectedChatId("");
       setMessages([]);
     }
-  }, [chats, selectedChatId]);
+  }, [chats, selectedChatId, currentUser]);
+
+  useEffect(() => {
+    if (!currentUser || !selectedChatId || typeof window === "undefined") return;
+    localStorage.setItem(getSessionKey("last_chat"), selectedChatId);
+  }, [currentUser, selectedChatId]);
 
   useEffect(() => {
     if (!isMobileLayout) return;
@@ -869,6 +1000,15 @@ export default function App() {
       setMobileSubgroupsOpen(false);
     }
   }, [isMobileLayout, selectedChatId]);
+
+  useEffect(() => {
+    setUnlockPinDraft("");
+    setUnlockStatus("");
+    setShowRecovery(false);
+    setRecoveryAnswerDraft("");
+    setNewPinDraft("");
+    setReplyingTo(null);
+  }, [selectedChatId]);
 
   useEffect(() => {
     if (!selectedChatId) return undefined;
@@ -884,6 +1024,41 @@ export default function App() {
       },
     );
     return () => unsub();
+  }, [selectedChatId]);
+
+  useEffect(() => {
+    if (!selectedChatId || !messagesRef.current) return;
+    if (lastScrollChatIdRef.current !== selectedChatId) {
+      const target = messagesRef.current;
+      requestAnimationFrame(() => {
+        target.scrollTop = target.scrollHeight;
+        nearBottomRef.current = true;
+      });
+      lastScrollChatIdRef.current = selectedChatId;
+      lastMessageCountRef.current = messages.length;
+      return;
+    }
+
+    const hasNewMessages = messages.length > lastMessageCountRef.current;
+    if (hasNewMessages && nearBottomRef.current) {
+      const target = messagesRef.current;
+      requestAnimationFrame(() => {
+        target.scrollTop = target.scrollHeight;
+      });
+    }
+    lastMessageCountRef.current = messages.length;
+  }, [selectedChatId, messages.length]);
+
+  useEffect(() => {
+    if (!messagesRef.current) return undefined;
+    const target = messagesRef.current;
+    const onScroll = () => {
+      const distanceFromBottom = target.scrollHeight - target.scrollTop - target.clientHeight;
+      nearBottomRef.current = distanceFromBottom <= 140;
+    };
+    onScroll();
+    target.addEventListener("scroll", onScroll);
+    return () => target.removeEventListener("scroll", onScroll);
   }, [selectedChatId]);
 
   async function clearTypingState(chatId = selectedChatId) {
@@ -963,6 +1138,49 @@ export default function App() {
   }, [showProfile, username]);
 
   useEffect(() => {
+    if (!mediaFile) {
+      setMediaPreviewURL("");
+      return undefined;
+    }
+    if (!(mediaFile.type || "").startsWith("image/") && !(mediaFile.type || "").startsWith("video/")) {
+      setMediaPreviewURL("");
+      return undefined;
+    }
+    const url = URL.createObjectURL(mediaFile);
+    setMediaPreviewURL(url);
+    return () => URL.revokeObjectURL(url);
+  }, [mediaFile]);
+
+  useEffect(() => {
+    if (!currentUser || typeof window === "undefined") return;
+    const key = `textinger_privacy_${currentUser.uid}`;
+    try {
+      const parsed = JSON.parse(localStorage.getItem(key) || "{}");
+      setBlockedUserIds(Array.isArray(parsed.blockedUserIds) ? parsed.blockedUserIds : []);
+      setMutedUserIds(Array.isArray(parsed.mutedUserIds) ? parsed.mutedUserIds : []);
+      setChatLocks(parsed.chatLocks && typeof parsed.chatLocks === "object" ? parsed.chatLocks : {});
+    } catch {
+      setBlockedUserIds([]);
+      setMutedUserIds([]);
+      setChatLocks({});
+    }
+    setUnlockedChatIds([]);
+  }, [currentUser]);
+
+  useEffect(() => {
+    if (!currentUser || typeof window === "undefined") return;
+    const key = `textinger_privacy_${currentUser.uid}`;
+    localStorage.setItem(
+      key,
+      JSON.stringify({
+        blockedUserIds,
+        mutedUserIds,
+        chatLocks,
+      }),
+    );
+  }, [currentUser, blockedUserIds, mutedUserIds, chatLocks]);
+
+  useEffect(() => {
     if (!showGroupProfile || !selectedChat?.isGroup) return;
     setGroupProfileNameDraft(selectedChat.groupName || "");
     setGroupDescriptionDraft(selectedChat.groupDescription || "");
@@ -1007,6 +1225,8 @@ export default function App() {
       }
 
       const otherUid = (chat.members || []).find((member) => member !== currentUser.uid);
+      if (!chat.isGroup && otherUid && blockedUserIds.includes(otherUid)) continue;
+      if (!chat.isGroup && otherUid && mutedUserIds.includes(otherUid)) continue;
       const other = otherUid ? usersById.get(otherUid) : null;
       const chatTitle = chat.isGroup
         ? chat.groupName || "Group Chat"
@@ -1015,7 +1235,7 @@ export default function App() {
     }
 
     chatMetaRef.current = nextMap;
-  }, [chats, currentUser, usersById, selectedChatId]);
+  }, [chats, currentUser, usersById, selectedChatId, blockedUserIds, mutedUserIds]);
 
   useEffect(() => {
     if (!selectedChatId) return;
@@ -1136,6 +1356,103 @@ export default function App() {
     if (!userId) return;
     setViewedUserId(userId);
     setShowUserProfileView(true);
+  }
+
+  function toggleBlockedUser(userId) {
+    if (!userId) return;
+    setBlockedUserIds((prev) =>
+      prev.includes(userId) ? prev.filter((id) => id !== userId) : [...prev, userId],
+    );
+  }
+
+  function toggleMutedUser(userId) {
+    if (!userId) return;
+    setMutedUserIds((prev) =>
+      prev.includes(userId) ? prev.filter((id) => id !== userId) : [...prev, userId],
+    );
+  }
+
+  function toggleChatLockForUser(userId) {
+    if (!currentUser || !userId) return;
+    const chatId = buildChatId(currentUser.uid, userId);
+    const lockConfig = getChatLockConfig(chatLocks, chatId);
+    if (lockConfig) {
+      const enteredPin = window.prompt("Enter current PIN to permanently unlock this chat:");
+      if (!enteredPin) return;
+      if (enteredPin.trim() !== lockConfig.pin) {
+        setProfileStatus("Incorrect PIN. Could not unlock chat permanently.");
+        return;
+      }
+      setChatLocks((prev) => {
+        const next = { ...prev };
+        delete next[chatId];
+        return next;
+      });
+      setUnlockedChatIds((prev) => prev.filter((id) => id !== chatId));
+      setProfileStatus("Chat lock removed permanently.");
+      return;
+    }
+    const pin = window.prompt("Set a 4-digit PIN for this chat lock:");
+    if (!pin) return;
+    if (!/^\d{4}$/.test(pin.trim())) {
+      setProfileStatus("PIN must be exactly 4 digits.");
+      return;
+    }
+    const answer = window.prompt("Security question setup: What is your best friend name?");
+    if (!answer?.trim()) {
+      setProfileStatus("Security answer is required to enable chat lock.");
+      return;
+    }
+    setChatLocks((prev) => ({
+      ...prev,
+      [chatId]: {
+        pin: pin.trim(),
+        recoveryAnswer: answer.trim().toLowerCase(),
+      },
+    }));
+    setUnlockedChatIds((prev) => (prev.includes(chatId) ? prev : [...prev, chatId]));
+    setProfileStatus("Chat lock enabled.");
+  }
+
+  function unlockCurrentChat() {
+    if (!selectedChatId) return;
+    const lockConfig = getChatLockConfig(chatLocks, selectedChatId);
+    if (!lockConfig) return;
+    if (unlockPinDraft.trim() !== lockConfig.pin) {
+      setUnlockStatus("Incorrect PIN.");
+      return;
+    }
+    setUnlockedChatIds((prev) => (prev.includes(selectedChatId) ? prev : [...prev, selectedChatId]));
+    setUnlockPinDraft("");
+    setUnlockStatus("");
+  }
+
+  function recoverLockedChat() {
+    if (!selectedChatId) return;
+    const lockConfig = getChatLockConfig(chatLocks, selectedChatId);
+    if (!lockConfig) return;
+    const normalized = recoveryAnswerDraft.trim().toLowerCase();
+    if (!normalized || normalized !== lockConfig.recoveryAnswer) {
+      setUnlockStatus("Incorrect answer for recovery question.");
+      return;
+    }
+    if (!/^\d{4}$/.test(newPinDraft.trim())) {
+      setUnlockStatus("Set a valid new 4-digit PIN.");
+      return;
+    }
+    setChatLocks((prev) => ({
+      ...prev,
+      [selectedChatId]: {
+        pin: newPinDraft.trim(),
+        recoveryAnswer: lockConfig.recoveryAnswer,
+      },
+    }));
+    setUnlockedChatIds((prev) => (prev.includes(selectedChatId) ? prev : [...prev, selectedChatId]));
+    setUnlockStatus("PIN reset successful. Chat unlocked.");
+    setShowRecovery(false);
+    setRecoveryAnswerDraft("");
+    setNewPinDraft("");
+    setUnlockPinDraft("");
   }
 
   async function syncChatLastMessage(chatId) {
@@ -1297,9 +1614,35 @@ export default function App() {
     }
   }
 
+  async function sendPayload(payload, options = {}) {
+    if (!selectedChat || !currentUser) return;
+    await addDoc(collection(db, "chats", selectedChat.id, "messages"), payload);
+    const lastMessage =
+      options.lastMessage ||
+      payload.text ||
+      (payload.mediaType?.startsWith("image/")
+        ? "Photo"
+        : payload.mediaType?.startsWith("video/")
+          ? "Video"
+          : payload.mediaType?.startsWith("audio/")
+            ? "Audio"
+            : payload.mediaURL
+              ? "File"
+              : "No messages yet");
+    await updateDoc(doc(db, "chats", selectedChat.id), {
+      lastMessage,
+      lastSenderId: payload.senderId || currentUser.uid,
+      updatedAt: serverTimestamp(),
+    });
+  }
+
   async function sendMessage(event) {
     event.preventDefault();
-    if (!selectedChat || !currentUser || (!text.trim() && !mediaFile) || sending) return;
+    if (!selectedChat || !currentUser || (!text.trim() && !mediaFile) || sending || selectedChatIsLocked) return;
+    if (!selectedChat.isGroup && selectedChatOtherUser && blockedUserIds.includes(selectedChatOtherUser.id)) {
+      setComposerStatus("Unblock this user first to send messages.");
+      return;
+    }
     if (mediaFile && mediaFile.size > MAX_UPLOAD_BYTES) {
       setMediaFile(null);
       setComposerStatus("Upload blocked: file must be 7MB or smaller.");
@@ -1323,7 +1666,7 @@ export default function App() {
         mediaSize = mediaFile.size || 0;
       }
 
-      const payload = {
+      const payload = attachReplyMetadata({
         senderId: currentUser.uid,
         senderName: username,
         text: text.trim(),
@@ -1332,32 +1675,89 @@ export default function App() {
         mediaName,
         mediaSize,
         createdAt: serverTimestamp(),
-      };
-
-      await addDoc(collection(db, "chats", selectedChat.id, "messages"), payload);
-      const lastMessage =
-        payload.text ||
-        (mediaType.startsWith("image/")
-          ? "Photo"
-          : mediaType.startsWith("video/")
-            ? "Video"
-            : mediaType.startsWith("audio/")
-              ? "Audio"
-              : mediaURL
-                ? "File"
-                : "No messages yet");
-      await updateDoc(doc(db, "chats", selectedChat.id), {
-        lastMessage,
-        lastSenderId: payload.senderId,
-        updatedAt: serverTimestamp(),
       });
+
+      await sendPayload(payload);
       setText("");
+      setReplyingTo(null);
       typingTextRef.current = "";
       await clearTypingState();
       setMediaFile(null);
       setAttachMenuOpen(false);
     } finally {
       setSending(false);
+      setBusyLabel("");
+    }
+  }
+
+  async function sendContactCard() {
+    if (!selectedChat || !currentUser || sending || selectedChatIsLocked) return;
+    if (!selectedChat.isGroup && selectedChatOtherUser && blockedUserIds.includes(selectedChatOtherUser.id)) {
+      setComposerStatus("Unblock this user first to send messages.");
+      return;
+    }
+    const name = window.prompt("Contact name");
+    if (!name?.trim()) return;
+    const phone = window.prompt("Contact phone number");
+    if (!phone?.trim()) return;
+    setBusyLabel("Sending contact...");
+    try {
+      await sendPayload(
+        attachReplyMetadata({
+          senderId: currentUser.uid,
+          senderName: username,
+          text: `Contact: ${name.trim()} (${phone.trim()})`,
+          messageType: "contact",
+          contactName: name.trim(),
+          contactPhone: phone.trim(),
+          createdAt: serverTimestamp(),
+        }),
+        { lastMessage: `Contact: ${name.trim()}` },
+      );
+      setReplyingTo(null);
+      setAttachMenuOpen(false);
+    } finally {
+      setBusyLabel("");
+    }
+  }
+
+  async function sendCurrentLocation() {
+    if (!selectedChat || !currentUser || sending || selectedChatIsLocked) return;
+    if (!selectedChat.isGroup && selectedChatOtherUser && blockedUserIds.includes(selectedChatOtherUser.id)) {
+      setComposerStatus("Unblock this user first to send messages.");
+      return;
+    }
+    if (!navigator.geolocation) {
+      setComposerStatus("Location is not supported in this browser.");
+      return;
+    }
+    setBusyLabel("Fetching location...");
+    try {
+      const position = await new Promise((resolve, reject) => {
+        navigator.geolocation.getCurrentPosition(resolve, reject, {
+          enableHighAccuracy: true,
+          timeout: 10000,
+        });
+      });
+      const latitude = Number(position.coords.latitude || 0);
+      const longitude = Number(position.coords.longitude || 0);
+      const mapsURL = `https://maps.google.com/?q=${latitude},${longitude}`;
+      await sendPayload(
+        attachReplyMetadata({
+          senderId: currentUser.uid,
+          senderName: username,
+          text: `Location: ${mapsURL}`,
+          messageType: "location",
+          location: { latitude, longitude },
+          createdAt: serverTimestamp(),
+        }),
+        { lastMessage: "Location shared" },
+      );
+      setReplyingTo(null);
+      setAttachMenuOpen(false);
+    } catch {
+      setComposerStatus("Unable to fetch location.");
+    } finally {
       setBusyLabel("");
     }
   }
@@ -2107,13 +2507,13 @@ export default function App() {
           </div>
         </header>
 
-        <div className={`panelBody ${selectedChat?.isGroup ? "withSubgroups" : ""}`}>
+        <div className={`panelBody ${selectedChat?.isGroup ? "withSubgroups" : ""} ${selectedChatIsLocked ? "chatLocked" : ""}`}>
         <section className="messageArea">
           {selectedChat ? (
             <>
-              <div className="messages">
+              <div className="messages" ref={messagesRef}>
                 {messagesLoading && <p className="muted">Loading messages...</p>}
-                {!messagesLoading && messages.length === 0 && <p className="muted">There is no message here.</p>}
+                {!messagesLoading && visibleMessages.length === 0 && <p className="muted">There is no message here.</p>}
                 {groupedMessages.map((group) => {
                   const senderUser = usersById.get(group.senderId);
                   const senderName =
@@ -2154,6 +2554,12 @@ export default function App() {
                           const canDeleteMessage = canDeleteGroupMessage(selectedChat, msg, currentUser?.uid);
                           return (
                             <div key={msg.id} className="groupedMessageItem">
+                              {msg.replyToMessageId && (
+                                <div className="replyContext">
+                                  <strong>{msg.replyToSenderName || "User"}</strong>
+                                  <small>{msg.replyToText || "Message"}</small>
+                                </div>
+                              )}
                               {editingMessageId === msg.id ? (
                                 <div className="editBox">
                                   <input
@@ -2172,7 +2578,7 @@ export default function App() {
                                   </div>
                                 </div>
                               ) : (
-                                msg.text && <p>{msg.text}</p>
+                                msg.text && <p>{renderTextWithLinks(msg.text)}</p>
                               )}
                               {msg.mediaURL && (
                                 <div className="mediaBlock">
@@ -2219,6 +2625,13 @@ export default function App() {
                                   </button>
                                   {openMessageMenuId === msg.id && (
                                     <div className="messageMenu" onClick={(event) => event.stopPropagation()}>
+                                      <button
+                                        type="button"
+                                        className="ghost menuItem"
+                                        onClick={() => beginReplyToMessage(msg)}
+                                      >
+                                        Reply
+                                      </button>
                                       <button type="button" className="ghost menuItem" onClick={() => copyMessage(msg)}>
                                         Copy
                                       </button>
@@ -2261,7 +2674,32 @@ export default function App() {
                 })}
               </div>
 
-              <form onSubmit={sendMessage} className="composer">
+              {(mediaPreviewURL || mediaFile) && (
+                <div className="mediaPreviewCard">
+                  {mediaPreviewURL && (mediaFile?.type || "").startsWith("image/") && (
+                    <img src={mediaPreviewURL} alt={mediaFile?.name || "Preview"} className="composerPreviewImage" />
+                  )}
+                  {mediaPreviewURL && (mediaFile?.type || "").startsWith("video/") && (
+                    <video controls className="composerPreviewVideo">
+                      <source src={mediaPreviewURL} type={mediaFile?.type || "video/mp4"} />
+                    </video>
+                  )}
+                  {!mediaPreviewURL && mediaFile && <p className="muted">Ready to send: {mediaFile.name}</p>}
+                </div>
+              )}
+              {replyingTo && (
+                <div className="replyComposerBar">
+                  <div>
+                    <strong>Replying to {replyingTo.senderName}</strong>
+                    <small>{replyingTo.text}</small>
+                  </div>
+                  <button type="button" className="ghost" onClick={() => setReplyingTo(null)}>
+                    Cancel
+                  </button>
+                </div>
+              )}
+
+              <form onSubmit={sendMessage} className="composer" ref={composerFormRef}>
                 <div className="attachWrap">
                   <button
                     type="button"
@@ -2305,6 +2743,38 @@ export default function App() {
                       >
                         Event
                       </button>
+                      <button
+                        type="button"
+                        className="ghost menuItem"
+                        onClick={() => {
+                          sendContactCard().catch(() => {});
+                          setAttachMenuOpen(false);
+                        }}
+                      >
+                        Contact
+                      </button>
+                      <button
+                        type="button"
+                        className="ghost menuItem"
+                        onClick={() => {
+                          sendCurrentLocation().catch(() => {});
+                          setAttachMenuOpen(false);
+                        }}
+                      >
+                        Location
+                      </button>
+                      {isMobileLayout && (
+                        <button
+                          type="button"
+                          className="ghost menuItem"
+                          onClick={() => {
+                            cameraInputRef.current?.click();
+                            setAttachMenuOpen(false);
+                          }}
+                        >
+                          Camera
+                        </button>
+                      )}
                     </div>
                   )}
                   <input
@@ -2321,9 +2791,16 @@ export default function App() {
                     onChange={(event) => handleComposerFileSelect(event.target.files?.[0] || null)}
                     hidden
                   />
+                  <input
+                    type="file"
+                    ref={cameraInputRef}
+                    accept="image/*"
+                    capture="environment"
+                    onChange={(event) => handleComposerFileSelect(event.target.files?.[0] || null)}
+                    hidden
+                  />
                 </div>
-                <input
-                  type="text"
+                <textarea
                   placeholder={
                     mediaFile
                       ? `Add a caption for ${mediaFile.name}`
@@ -2332,12 +2809,14 @@ export default function App() {
                         : "Type a message..."
                   }
                   value={text}
+                  rows={2}
                   onChange={(event) => {
                     const nextText = event.target.value;
                     setText(nextText);
                     typingTextRef.current = nextText;
                     publishTypingState(nextText).catch(() => {});
                   }}
+                  onKeyDown={handleComposerKeyDown}
                   onBlur={() => {
                     if (!typingTextRef.current.trim()) {
                       clearTypingState();
@@ -2345,8 +2824,8 @@ export default function App() {
                   }}
                   maxLength={500}
                 />
-                <button type="submit" disabled={sending || (!text.trim() && !mediaFile)}>
-                  Send
+                <button type="submit" disabled={sending || selectedChatIsLocked || (!text.trim() && !mediaFile)}>
+                  {isMobileLayout ? "Enter" : "Send"}
                 </button>
               </form>
               {typingStreams.length > 0 && (
@@ -2383,6 +2862,61 @@ export default function App() {
             </div>
           )}
         </section>
+        {selectedChat && selectedChatIsLocked && (
+          <div className="chatLockOverlay">
+            <div className="chatLockGate">
+              <h3>Chat Locked</h3>
+              <p className="muted">Enter your 4-digit PIN to continue this session.</p>
+              <input
+                type="password"
+                value={unlockPinDraft}
+                maxLength={4}
+                placeholder="PIN"
+                onChange={(event) => setUnlockPinDraft(event.target.value.replace(/\D/g, ""))}
+              />
+              <div className="groupStepActions">
+                <button type="button" onClick={unlockCurrentChat}>
+                  Unlock
+                </button>
+              </div>
+              <button
+                type="button"
+                className="ghost"
+                onClick={() => {
+                  setShowRecovery((prev) => !prev);
+                  setUnlockStatus("");
+                }}
+              >
+                {showRecovery ? "Cancel Recovery" : "Forgot PIN?"}
+              </button>
+              {showRecovery && (
+                <div className="stack lockRecoveryBox">
+                  <p className="muted"><strong>Security question:</strong> What is your best friend name?</p>
+                  <input
+                    type="text"
+                    value={recoveryAnswerDraft}
+                    placeholder="Your answer"
+                    onChange={(event) => setRecoveryAnswerDraft(event.target.value)}
+                    maxLength={60}
+                  />
+                  <input
+                    type="password"
+                    value={newPinDraft}
+                    maxLength={4}
+                    placeholder="New 4-digit PIN"
+                    onChange={(event) => setNewPinDraft(event.target.value.replace(/\D/g, ""))}
+                  />
+                  <div className="groupStepActions">
+                    <button type="button" onClick={recoverLockedChat}>
+                      Reset PIN & Unlock
+                    </button>
+                  </div>
+                </div>
+              )}
+              {unlockStatus && <p className="muted">{unlockStatus}</p>}
+            </div>
+          </div>
+        )}
         {isMobileLayout && selectedChat?.isGroup && mobileSubgroupsOpen && (
           <button
             type="button"
@@ -3002,7 +3536,7 @@ export default function App() {
                     <strong>{item.senderName || "User"}</strong>
                     <small>{formatTime(item.savedAt)}</small>
                   </div>
-                  {item.text && <p>{item.text}</p>}
+                  {item.text && <p>{renderTextWithLinks(item.text)}</p>}
                   {item.mediaURL && (
                     <div className="mediaBlock">
                       {item.mediaType?.startsWith("image/") ? (
@@ -3050,6 +3584,11 @@ export default function App() {
               const viewedEmail = viewed?.email || "Hidden";
               const viewedBio = viewed?.bio || "No bio yet.";
               const viewedOnline = isUserOnline(viewed);
+              const viewedChatId =
+                currentUser && viewedUserId ? buildChatId(currentUser.uid, viewedUserId) : "";
+              const isBlocked = blockedUserIds.includes(viewedUserId);
+              const isMuted = mutedUserIds.includes(viewedUserId);
+              const isLocked = viewedChatId ? Boolean(getChatLockConfig(chatLocks, viewedChatId)) : false;
               return (
                 <div className="profileCard">
                   <div className="profileAvatarWrap">
@@ -3072,6 +3611,19 @@ export default function App() {
                   <p>
                     <strong>Bio:</strong> {viewedBio}
                   </p>
+                  {currentUser && viewedUserId !== currentUser.uid && (
+                    <div className="requestActions">
+                      <button type="button" className="ghost" onClick={() => toggleBlockedUser(viewedUserId)}>
+                        {isBlocked ? "Unblock" : "Block"}
+                      </button>
+                      <button type="button" className="ghost" onClick={() => toggleMutedUser(viewedUserId)}>
+                        {isMuted ? "Unmute" : "Mute"}
+                      </button>
+                      <button type="button" className="ghost" onClick={() => toggleChatLockForUser(viewedUserId)}>
+                        {isLocked ? "Unlock Chat" : "Lock Chat"}
+                      </button>
+                    </div>
+                  )}
                 </div>
               );
             })()}

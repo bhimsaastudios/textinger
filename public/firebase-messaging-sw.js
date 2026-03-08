@@ -32,5 +32,35 @@ if (firebaseConfig.apiKey && firebaseConfig.projectId && firebaseConfig.messagin
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   const target = event.notification?.data?.link || "/";
-  event.waitUntil(clients.openWindow(target));
+  event.waitUntil(
+    clients.matchAll({ type: "window", includeUncontrolled: true }).then((windowClients) => {
+      for (const client of windowClients) {
+        const hasClientFocus = typeof client.focus === "function";
+        if (hasClientFocus) {
+          client.postMessage({ type: "OPEN_CHAT_FROM_NOTIFICATION", link: target });
+          return client.focus();
+        }
+      }
+      return clients.openWindow(target);
+    }),
+  );
+});
+
+self.addEventListener("push", (event) => {
+  try {
+    const payload = event.data?.json?.() || {};
+    if (payload?.notification?.title || payload?.notification?.body) return;
+    const title = payload?.data?.title || "Textinger";
+    const body = payload?.data?.body || "You have a new message.";
+    const link = payload?.data?.link || "/";
+    event.waitUntil(
+      self.registration.showNotification(title, {
+        body,
+        icon: "/app-logo.png",
+        data: { link },
+      }),
+    );
+  } catch {
+    // no-op
+  }
 });

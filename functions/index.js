@@ -84,8 +84,15 @@ exports.sendPushOnNewMessage = onDocumentCreated(
         senderId,
         senderName,
         type: "chat_message",
+        title,
+        body,
+        link: "/",
       },
       webpush: {
+        headers: {
+          Urgency: "high",
+          TTL: "2419200",
+        },
         notification: {
           icon: "/app-logo.png",
           badge: "/app-logo.png",

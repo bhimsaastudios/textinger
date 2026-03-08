@@ -47,7 +47,8 @@ body {
 
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
 }
 
@@ -85,6 +86,18 @@ input {
   padding: 0.66rem 0.75rem;
   background: #1e1f22;
   color: var(--text);
+}
+
+textarea {
+  width: 100%;
+  border: 1px solid #1a1b1e;
+  border-radius: 8px;
+  padding: 0.66rem 0.75rem;
+  background: #1e1f22;
+  color: var(--text);
+  resize: vertical;
+  min-height: 44px;
+  max-height: 160px;
 }
 
 select {
@@ -469,6 +482,13 @@ input::placeholder {
   grid-template-columns: minmax(0, 1fr) 260px;
 }
 
+.panelBody.chatLocked .messageArea,
+.panelBody.chatLocked .subgroupRail {
+  filter: blur(4px);
+  pointer-events: none;
+  user-select: none;
+}
+
 .panelTop {
   display: flex;
   justify-content: space-between;
@@ -551,6 +571,47 @@ input::placeholder {
   flex-direction: column;
   min-height: 0;
   overflow: hidden;
+}
+
+.chatLockOverlay {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background: rgba(0, 0, 0, 0.28);
+}
+
+.chatLockGate {
+  width: min(360px, 100%);
+  display: grid;
+  gap: 0.7rem;
+  justify-items: center;
+  padding: 0.95rem;
+  border-radius: 12px;
+  border: 1px solid #3a3d43;
+  background: #2b2d31;
+}
+
+.chatLockGate h3,
+.chatLockGate p {
+  margin: 0;
+}
+
+.chatLockGate input {
+  width: min(280px, 100%);
+  text-align: center;
+  letter-spacing: 0.2em;
+}
+
+.lockRecoveryBox {
+  width: 100%;
+}
+
+.lockRecoveryBox input {
+  text-align: left;
+  letter-spacing: normal;
 }
 
 .subgroupRail {
@@ -759,6 +820,7 @@ input::placeholder {
 .bubble p {
   margin: 0;
   word-break: break-word;
+  white-space: pre-wrap;
 }
 
 .groupedMessageStack {
@@ -770,6 +832,26 @@ input::placeholder {
   border-radius: 10px;
   padding: 0.35rem 0.45rem;
   border-bottom: 1px solid rgba(198, 201, 207, 0.2);
+}
+
+.replyContext {
+  border-left: 3px solid #7f89ff;
+  background: rgba(127, 137, 255, 0.12);
+  border-radius: 6px;
+  padding: 0.28rem 0.45rem;
+  margin-bottom: 0.3rem;
+  display: grid;
+  gap: 0.1rem;
+}
+
+.replyContext strong {
+  font-size: 0.78rem;
+}
+
+.replyContext small {
+  color: #b8bdd7;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .messageFoot {
@@ -797,6 +879,48 @@ input::placeholder {
   display: grid;
   grid-template-columns: auto 1fr auto;
   gap: 0.6rem;
+}
+
+.mediaPreviewCard {
+  border-top: 1px solid #3a3d43;
+  border-bottom: 1px solid #3a3d43;
+  padding: 0.55rem 0.7rem;
+  display: grid;
+  gap: 0.45rem;
+}
+
+.replyComposerBar {
+  border-top: 1px solid #3a3d43;
+  padding: 0.45rem 0.7rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.6rem;
+  background: #2b2d31;
+}
+
+.replyComposerBar div {
+  min-width: 0;
+  display: grid;
+}
+
+.replyComposerBar strong {
+  font-size: 0.82rem;
+}
+
+.replyComposerBar small {
+  color: #a3a6aa;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.composerPreviewImage,
+.composerPreviewVideo {
+  width: min(300px, 100%);
+  max-height: 220px;
+  border-radius: 10px;
+  object-fit: cover;
 }
 
 .attachWrap {
@@ -874,6 +998,12 @@ input::placeholder {
   color: #78a9ff;
   text-decoration: underline;
   word-break: break-all;
+}
+
+.textLink {
+  color: #8eb8ff;
+  text-decoration: underline;
+  word-break: break-word;
 }
 
 .danger {
@@ -1277,6 +1407,7 @@ input::placeholder {
 .savedItem p {
   margin: 0.2rem 0;
   word-break: break-word;
+  white-space: pre-wrap;
 }
 
 .savedActions {
