@@ -2,7 +2,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   createUserWithEmailAndPassword,
   deleteUser,
+  GoogleAuthProvider,
   onAuthStateChanged,
+  signInWithCredential,
+  signInWithPopup,
   sendEmailVerification,
   sendPasswordResetEmail,
   signInWithEmailAndPassword,
@@ -12,6 +15,7 @@ import {
 import {
   addDoc,
   arrayUnion,
+  arrayRemove,
   collection,
   deleteDoc,
   doc,
@@ -30,6 +34,9 @@ import {
   where,
 } from "firebase/firestore";
 import { getToken, onMessage } from "firebase/messaging";
+import { Capacitor } from "@capacitor/core";
+import { PushNotifications } from "@capacitor/push-notifications";
+import { SocialLogin } from "@capgo/capacitor-social-login";
 import { auth, db, getFirebaseMessaging } from "./firebase";
 
 const MAX_ACTIVE_USERS = 150;
@@ -43,6 +50,66 @@ const CHAT_PREVIEW_MAX_LENGTH = 72;
 const GROUP_ROLES = ["member", "editor", "admin", "owner"];
 const ONE_SIGNAL_APP_ID = import.meta.env.VITE_ONESIGNAL_APP_ID || "";
 const ONE_SIGNAL_NOTIFY_URL = import.meta.env.VITE_ONESIGNAL_NOTIFY_URL || "";
+const IS_NATIVE_APP = Capacitor.getPlatform() !== "web";
+const IS_NATIVE_MOBILE_APP = Capacitor.getPlatform() === "android" || Capacitor.getPlatform() === "ios";
+const GOOGLE_WEB_CLIENT_ID =
+  import.meta.env.VITE_GOOGLE_WEB_CLIENT_ID ||
+  "732830287788-ujcbdnppln993d0qrgkskqua47bq1u6s.apps.googleusercontent.com";
+const QUICK_REACTION_DEFAULTS = ["👍", "❤️", "😂", "🔥"];
+const TIMED_MESSAGE_OPTIONS = [
+  { label: "10s", value: 10 * 1000 },
+  { label: "30s", value: 30 * 1000 },
+  { label: "1m", value: 60 * 1000 },
+  { label: "5m", value: 5 * 60 * 1000 },
+];
+const SPECIAL_MESSAGE_DAILY_LIMIT = 5;
+const GAME_COUNTDOWN_MS = 3 * 1000;
+const GAME_TYPES = {
+  tictactoe: "tictactoe",
+  rps: "rps",
+  ludo: "ludo",
+};
+const RPS_CHOICES = ["rock", "paper", "scissors"];
+const LUDO_GRID_SIZE = 15;
+const LUDO_OUTER_TRACK_LENGTH = 52;
+const LUDO_HOME_STEPS = 6;
+const LUDO_FINISH_INDEX = LUDO_OUTER_TRACK_LENGTH + LUDO_HOME_STEPS - 1;
+const LUDO_TOKEN_COUNT = 2;
+const LUDO_PLAYER_OFFSETS = [0, 13, 26, 39];
+const LUDO_LOOP_CELLS = [
+  [6, 13], [6, 12], [6, 11], [6, 10], [6, 9],
+  [5, 8], [4, 8], [3, 8], [2, 8], [1, 8], [0, 8], [0, 7], [0, 6],
+  [1, 6], [2, 6], [3, 6], [4, 6], [5, 6],
+  [6, 5], [6, 4], [6, 3], [6, 2], [6, 1], [6, 0],
+  [7, 0], [8, 0], [8, 1], [8, 2], [8, 3], [8, 4], [8, 5],
+  [9, 6], [10, 6], [11, 6], [12, 6], [13, 6], [14, 6], [14, 7], [14, 8],
+  [13, 8], [12, 8], [11, 8], [10, 8], [9, 8],
+  [8, 9], [8, 10], [8, 11], [8, 12], [8, 13], [8, 14], [7, 14], [6, 14],
+];
+const LUDO_HOME_COORDS = [
+  [
+    { x: 22.5, y: 77.5 },
+    { x: 31.5, y: 77.5 },
+  ],
+  [
+    { x: 22.5, y: 22.5 },
+    { x: 31.5, y: 22.5 },
+  ],
+  [
+    { x: 68.5, y: 22.5 },
+    { x: 77.5, y: 22.5 },
+  ],
+  [
+    { x: 68.5, y: 77.5 },
+    { x: 77.5, y: 77.5 },
+  ],
+];
+const LUDO_HOME_LANE_CELLS = [
+  [[7, 13], [7, 12], [7, 11], [7, 10], [7, 9], null],
+  [[1, 7], [2, 7], [3, 7], [4, 7], [5, 7], null],
+  [[7, 1], [7, 2], [7, 3], [7, 4], [7, 5], null],
+  [[13, 7], [12, 7], [11, 7], [10, 7], [9, 7], null],
+];
 
 function formatTime(value) {
   if (!value) return "";
@@ -62,6 +129,213 @@ function truncateText(value, maxLength = CHAT_PREVIEW_MAX_LENGTH) {
   const text = `${value || ""}`.trim();
   if (!text) return "";
   return text.length > maxLength ? `${text.slice(0, Math.max(0, maxLength - 3))}...` : text;
+}
+
+function formatReactionCount(list) {
+  return Array.isArray(list) ? list.length : 0;
+}
+
+function buildMessagePreviewLabel(payload) {
+  if (payload?.timedOut) return "Message timed out";
+  if (payload?.isEvent) return `[Event] ${payload.eventTitle || "Scheduled Event"}`;
+  if (payload?.isGameInvite) return `[Game Invite] ${formatGameTypeLabel(payload.gameType)}`;
+  if (payload?.isGameSession) return `[Game] ${formatGameTypeLabel(payload.gameType || payload.gameSessionType)}`;
+  if (payload?.viewOnce) return "One-time message";
+  if (payload?.expiresAt) return "Timed message";
+  return (
+    payload.text ||
+    (payload.mediaType?.startsWith("image/")
+      ? "Photo"
+      : payload.mediaType?.startsWith("video/")
+        ? "Video"
+        : payload.mediaType?.startsWith("audio/")
+          ? "Audio"
+          : payload.mediaURL
+            ? "File"
+            : "No messages yet")
+  );
+}
+
+function formatGameTypeLabel(type) {
+  if (type === GAME_TYPES.tictactoe) return "Tic-Tac-Toe";
+  if (type === GAME_TYPES.rps) return "Rock Paper Scissors";
+  if (type === GAME_TYPES.ludo) return "Ludo";
+  return "Game";
+}
+
+function createGameSession(type, players, startedBy) {
+  const startsAt = Timestamp.fromMillis(Date.now() + GAME_COUNTDOWN_MS);
+  const gamePlayers = (players || []).filter(Boolean);
+  const opponentId = gamePlayers.find((uid) => uid !== startedBy) || "";
+  const sessionId = `${type}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+  if (type === GAME_TYPES.tictactoe) {
+    return {
+      sessionId,
+      type,
+      status: "countdown",
+      startedBy,
+      startsAt,
+      players: gamePlayers,
+      board: Array(9).fill(""),
+      turn: startedBy,
+      marks: {
+        [startedBy]: "X",
+        [opponentId]: "O",
+      },
+      winner: "",
+      winnerLine: [],
+      updatedAt: serverTimestamp(),
+    };
+  }
+
+  if (type === GAME_TYPES.ludo) {
+    return {
+      sessionId,
+      type,
+      status: "countdown",
+      startedBy,
+      startsAt,
+      players: gamePlayers,
+      turn: startedBy,
+      currentRoll: 0,
+      lastRoll: 0,
+      tokens: Object.fromEntries(gamePlayers.map((uid) => [uid, Array(LUDO_TOKEN_COUNT).fill(-1)])),
+      finishedCounts: Object.fromEntries(gamePlayers.map((uid) => [uid, 0])),
+      resultText: "",
+      winner: "",
+      updatedAt: serverTimestamp(),
+    };
+  }
+
+  return {
+    sessionId,
+    type,
+    status: "countdown",
+    startedBy,
+    startsAt,
+    players: gamePlayers,
+    picks: {},
+    round: 1,
+    resultText: "",
+    winner: "",
+    updatedAt: serverTimestamp(),
+  };
+}
+
+function getNextLudoPlayer(players, currentUid) {
+  if (!Array.isArray(players) || players.length === 0) return currentUid || "";
+  const currentIndex = players.findIndex((uid) => uid === currentUid);
+  if (currentIndex === -1) return players[0] || currentUid || "";
+  return players[(currentIndex + 1) % players.length] || currentUid || "";
+}
+
+function getLudoMovableTokenIndexes(tokens, roll) {
+  if (!Array.isArray(tokens) || !roll) return [];
+  return tokens
+    .map((position, index) => {
+      if (position === LUDO_FINISH_INDEX) return null;
+      if (position === -1) return roll === 6 ? index : null;
+      const next = position + roll;
+      return next <= LUDO_FINISH_INDEX ? index : null;
+    })
+    .filter((value) => value !== null);
+}
+
+function moveLudoTokenState(tokens, index, roll) {
+  const nextTokens = [...tokens];
+  const current = nextTokens[index];
+  if (current === -1) {
+    nextTokens[index] = 0;
+  } else {
+    nextTokens[index] = Math.min(LUDO_FINISH_INDEX, current + roll);
+  }
+  return nextTokens;
+}
+
+function gridCellToPercent(col, row) {
+  return {
+    x: ((col + 0.5) / LUDO_GRID_SIZE) * 100,
+    y: ((row + 0.5) / LUDO_GRID_SIZE) * 100,
+  };
+}
+
+function getLudoBoardCell(position, playerIndex) {
+  if (position < 0) return null;
+  if (position < LUDO_OUTER_TRACK_LENGTH) {
+    const offset = LUDO_PLAYER_OFFSETS[playerIndex] || 0;
+    return LUDO_LOOP_CELLS[(position + offset) % LUDO_OUTER_TRACK_LENGTH];
+  }
+  const laneIndex = position - LUDO_OUTER_TRACK_LENGTH;
+  return LUDO_HOME_LANE_CELLS[playerIndex]?.[laneIndex] || null;
+}
+
+function getLudoTokenCoords(position, tokenIndex, playerIndex) {
+  if (position === -1) {
+    return LUDO_HOME_COORDS[playerIndex]?.[tokenIndex] || { x: 50, y: 50 };
+  }
+  if (position === LUDO_FINISH_INDEX) {
+    return { x: 50, y: 50 };
+  }
+  const cell = getLudoBoardCell(position, playerIndex);
+  return cell ? gridCellToPercent(cell[0], cell[1]) : { x: 50, y: 50 };
+}
+
+function countTruthyValues(record) {
+  if (!record || typeof record !== "object") return 0;
+  return Object.values(record).filter(Boolean).length;
+}
+
+function cloneGameTokens(tokens, players) {
+  return Object.fromEntries(
+    (players || []).map((uid) => [uid, Array.isArray(tokens?.[uid]) ? [...tokens[uid]] : Array(LUDO_TOKEN_COUNT).fill(-1)]),
+  );
+}
+
+function getTicTacToeWinner(board) {
+  const lines = [
+    [0, 1, 2],
+    [3, 4, 5],
+    [6, 7, 8],
+    [0, 3, 6],
+    [1, 4, 7],
+    [2, 5, 8],
+    [0, 4, 8],
+    [2, 4, 6],
+  ];
+  for (const line of lines) {
+    const [a, b, c] = line;
+    if (board[a] && board[a] === board[b] && board[a] === board[c]) {
+      return { symbol: board[a], line };
+    }
+  }
+  return null;
+}
+
+function getRpsWinner(picks, players) {
+  if (!Array.isArray(players) || players.length < 2) return { winner: "", resultText: "Waiting for players." };
+  const [firstPlayer, secondPlayer] = players;
+  const firstPick = picks?.[firstPlayer];
+  const secondPick = picks?.[secondPlayer];
+  if (!firstPick || !secondPick) return { winner: "", resultText: "Waiting for both players." };
+  if (firstPick === secondPick) {
+    return {
+      winner: "draw",
+      resultText: `Draw. Both picked ${firstPick}.`,
+    };
+  }
+  const winsAgainst = {
+    rock: "scissors",
+    paper: "rock",
+    scissors: "paper",
+  };
+  const winner = winsAgainst[firstPick] === secondPick ? firstPlayer : secondPlayer;
+  const winnerPick = winner === firstPlayer ? firstPick : secondPick;
+  const loserPick = winner === firstPlayer ? secondPick : firstPick;
+  return {
+    winner,
+    resultText: `${winnerPick} beats ${loserPick}.`,
+  };
 }
 
 function renderTextWithLinks(value) {
@@ -324,9 +598,12 @@ export default function App() {
   const [messagesLoading, setMessagesLoading] = useState(false);
   const [previewImage, setPreviewImage] = useState("");
   const [previewZoom, setPreviewZoom] = useState(1);
+  const [viewOnceOverlay, setViewOnceOverlay] = useState(null);
   const [editingMessageId, setEditingMessageId] = useState("");
   const [editingText, setEditingText] = useState("");
   const [openMessageMenuId, setOpenMessageMenuId] = useState("");
+  const [openReactionPickerId, setOpenReactionPickerId] = useState("");
+  const [customReactionEmoji, setCustomReactionEmoji] = useState("");
   const [friendEmail, setFriendEmail] = useState("");
   const [friendStatus, setFriendStatus] = useState("");
   const [profileStatus, setProfileStatus] = useState("");
@@ -337,6 +614,9 @@ export default function App() {
   const [showCreateGroup, setShowCreateGroup] = useState(false);
   const [showNotifications, setShowNotifications] = useState(false);
   const [showProfile, setShowProfile] = useState(false);
+  const [showGamesMenu, setShowGamesMenu] = useState(false);
+  const [showGameOverlay, setShowGameOverlay] = useState(false);
+  const [showGameCloseOptions, setShowGameCloseOptions] = useState(false);
   const [showEditProfile, setShowEditProfile] = useState(false);
   const [showSavedContent, setShowSavedContent] = useState(false);
   const [showUserProfileView, setShowUserProfileView] = useState(false);
@@ -345,6 +625,12 @@ export default function App() {
   const [eventDescriptionDraft, setEventDescriptionDraft] = useState("");
   const [eventTimeDraft, setEventTimeDraft] = useState("");
   const [eventStatus, setEventStatus] = useState("");
+  const [gameStatus, setGameStatus] = useState("");
+  const [gameToast, setGameToast] = useState("");
+  const [gameNowMs, setGameNowMs] = useState(Date.now());
+  const [diceAnimating, setDiceAnimating] = useState(false);
+  const [rpsRevealTick, setRpsRevealTick] = useState(0);
+  const [animatedLudoTokens, setAnimatedLudoTokens] = useState(null);
   const [eventPulseChatIds, setEventPulseChatIds] = useState([]);
   const [eventToast, setEventToast] = useState(null);
   const [mobileMessageToast, setMobileMessageToast] = useState(null);
@@ -366,13 +652,17 @@ export default function App() {
   const [savedStatus, setSavedStatus] = useState("");
   const [composerStatus, setComposerStatus] = useState("");
   const [replyingTo, setReplyingTo] = useState(null);
+  const [messageMode, setMessageMode] = useState({ type: "normal", durationMs: 0 });
+  const [timedMenuOpen, setTimedMenuOpen] = useState(false);
   const [showSpamWarning, setShowSpamWarning] = useState(false);
   const [isMobileLayout, setIsMobileLayout] = useState(() => {
     if (typeof window === "undefined") return false;
-    return window.innerWidth <= MOBILE_BREAKPOINT;
+    return IS_NATIVE_MOBILE_APP || window.innerWidth <= MOBILE_BREAKPOINT;
   });
   const [mobileScreen, setMobileScreen] = useState("list");
+  const [mobileNavSection, setMobileNavSection] = useState("messages");
   const [mobileSubgroupsOpen, setMobileSubgroupsOpen] = useState(false);
+  const [chatListCollapsed, setChatListCollapsed] = useState(false);
   const [notificationPermission, setNotificationPermission] = useState(() => {
     if (typeof Notification === "undefined") return "unsupported";
     return Notification.permission;
@@ -387,6 +677,17 @@ export default function App() {
   const [showRecovery, setShowRecovery] = useState(false);
   const [recoveryAnswerDraft, setRecoveryAnswerDraft] = useState("");
   const [newPinDraft, setNewPinDraft] = useState("");
+  const [openedViewOnceMessageIds, setOpenedViewOnceMessageIds] = useState([]);
+  const [soundEnabled, setSoundEnabled] = useState(() => {
+    if (typeof window === "undefined") return true;
+    const stored = localStorage.getItem("textinger_sound_enabled");
+    return stored === null ? true : stored === "1";
+  });
+  const [soundVolume, setSoundVolume] = useState(() => {
+    if (typeof window === "undefined") return 0.7;
+    const stored = Number(localStorage.getItem("textinger_sound_volume") || "0.7");
+    return Number.isFinite(stored) ? Math.min(1, Math.max(0, stored)) : 0.7;
+  });
   const mediaInputRef = useRef(null);
   const documentInputRef = useRef(null);
   const cameraInputRef = useRef(null);
@@ -407,6 +708,20 @@ export default function App() {
   const messageSendTimesRef = useRef([]);
   const oneSignalReadyRef = useRef(false);
   const oneSignalScriptLoadingRef = useRef(null);
+  const messageLongPressTimerRef = useRef(null);
+  const reactionPickerLockUntilRef = useRef(0);
+  const reactionPickerAutoCloseRef = useRef(null);
+  const gameAudioContextRef = useRef(null);
+  const previousGameSnapshotRef = useRef(null);
+  const ludoAnimationTimerRef = useRef(null);
+  const ludoRenderedTokensRef = useRef(null);
+  const soundPrefsHydratedRef = useRef(false);
+  const socialLoginInitRef = useRef(false);
+  const isTrueMobileDevice = useMemo(() => {
+    if (typeof window === "undefined") return false;
+    const ua = window.navigator.userAgent || "";
+    return /Android|iPhone|iPad|iPod|Mobile/i.test(ua) || IS_NATIVE_MOBILE_APP;
+  }, []);
 
   const usersById = useMemo(() => {
     const map = new Map();
@@ -424,6 +739,27 @@ export default function App() {
     const uid = (selectedChat.members || []).find((member) => member !== currentUser.uid);
     return uid ? usersById.get(uid) : null;
   }, [selectedChat, currentUser, usersById]);
+  const activeGame = selectedChat?.activeGame || null;
+  const gameOpponentId = useMemo(() => {
+    if (!activeGame || !currentUser) return "";
+    return (activeGame.players || []).find((uid) => uid !== currentUser.uid) || "";
+  }, [activeGame, currentUser]);
+  const activeGameOpponent = useMemo(
+    () => (gameOpponentId ? usersById.get(gameOpponentId) : null),
+    [gameOpponentId, usersById],
+  );
+  const activeGameStartsAtMs = activeGame?.startsAt?.toMillis?.() || 0;
+  const activeGameCountdown = activeGame?.status === "countdown" && activeGameStartsAtMs
+    ? Math.max(0, Math.ceil((activeGameStartsAtMs - gameNowMs) / 1000))
+    : 0;
+  const canUseGamesInChat = Boolean(selectedChat && !selectedChat.isGroup && (selectedChat.members || []).length === 2);
+  const canUseLudoInChat = Boolean(
+    selectedChat &&
+    (
+      (!selectedChat.isGroup && (selectedChat.members || []).length === 2) ||
+      (selectedChat.isGroup && (selectedChat.members || []).length === 4)
+    ),
+  );
   const selectedChatIsLocked = useMemo(
     () => Boolean(selectedChatId && getChatLockConfig(chatLocks, selectedChatId) && !unlockedChatIds.includes(selectedChatId)),
     [selectedChatId, chatLocks, unlockedChatIds],
@@ -515,22 +851,43 @@ export default function App() {
     if (!otherId || !blockedUserIds.includes(otherId)) return messages;
     return messages.filter((item) => item.senderId === currentUser.uid);
   }, [messages, selectedChat, currentUser, blockedUserIds]);
+  const hasPendingGameInvite = useMemo(
+    () => messages.some((message) => message.isGameInvite && message.inviteStatus === "pending"),
+    [messages],
+  );
   const groupedMessages = useMemo(() => {
     const groups = [];
     for (const message of visibleMessages) {
+      if (message.isEvent || message.isGameInvite || message.isGameSession) {
+        groups.push({
+          id: message.id,
+          senderId: "",
+          items: [message],
+          isTemplateGroup: true,
+        });
+        continue;
+      }
       const prev = groups[groups.length - 1];
-      if (prev && prev.senderId === message.senderId) {
+      if (prev && !prev.isTemplateGroup && prev.senderId === message.senderId) {
         prev.items.push(message);
       } else {
         groups.push({
           id: message.id,
           senderId: message.senderId || "",
           items: [message],
+          isTemplateGroup: false,
         });
       }
     }
     return groups;
   }, [visibleMessages]);
+  const quickReactionOptions = useMemo(() => {
+    const next = [...QUICK_REACTION_DEFAULTS];
+    if (customReactionEmoji) {
+      next[next.length - 1] = customReactionEmoji;
+    }
+    return next;
+  }, [customReactionEmoji]);
 
   function buildSavedId(chatId, messageId) {
     return `${chatId}_${messageId}`;
@@ -556,6 +913,94 @@ export default function App() {
     setComposerStatus("");
   }
 
+  function resetMessageMode() {
+    setMessageMode({ type: "normal", durationMs: 0 });
+    setTimedMenuOpen(false);
+  }
+
+  function describeMessageMode() {
+    if (messageMode.type === "viewOnce") return "One-time message";
+    if (messageMode.type === "timed" && messageMode.durationMs > 0) {
+      const option = TIMED_MESSAGE_OPTIONS.find((item) => item.value === messageMode.durationMs);
+      return option ? `Timed: ${option.label}` : "Timed message";
+    }
+    return "";
+  }
+
+  function persistCustomReactionEmoji(nextEmoji) {
+    setCustomReactionEmoji(nextEmoji);
+    if (typeof window === "undefined") return;
+    const key = currentUser ? getSessionKey("custom_reaction_emoji") : "textinger_custom_reaction_emoji_guest";
+    if (nextEmoji) {
+      localStorage.setItem(key, nextEmoji);
+    } else {
+      localStorage.removeItem(key);
+    }
+  }
+
+  function isInteractiveMessageTarget(target) {
+    if (!(target instanceof Element)) return false;
+    return Boolean(target.closest("button, a, input, textarea, video, audio, img"));
+  }
+
+  function toggleReactionPicker(messageId) {
+    if (reactionPickerAutoCloseRef.current) {
+      clearTimeout(reactionPickerAutoCloseRef.current);
+      reactionPickerAutoCloseRef.current = null;
+    }
+    setOpenMessageMenuId("");
+    setOpenReactionPickerId((prev) => (prev === messageId ? "" : messageId));
+  }
+
+  function beginMessageLongPress(messageId) {
+    if (messageLongPressTimerRef.current) {
+      clearTimeout(messageLongPressTimerRef.current);
+    }
+    messageLongPressTimerRef.current = setTimeout(() => {
+      reactionPickerLockUntilRef.current = Date.now() + 4000;
+      toggleReactionPicker(messageId);
+      reactionPickerAutoCloseRef.current = setTimeout(() => {
+        reactionPickerLockUntilRef.current = 0;
+        setOpenReactionPickerId((prev) => (prev === messageId ? "" : prev));
+        reactionPickerAutoCloseRef.current = null;
+      }, 4000);
+      messageLongPressTimerRef.current = null;
+    }, 420);
+  }
+
+  function cancelMessageLongPress() {
+    if (!messageLongPressTimerRef.current) return;
+    clearTimeout(messageLongPressTimerRef.current);
+    messageLongPressTimerRef.current = null;
+  }
+
+  function chooseCustomReactionEmoji() {
+    const nextEmoji = window.prompt("Enter one emoji for quick reactions", customReactionEmoji || QUICK_REACTION_DEFAULTS[QUICK_REACTION_DEFAULTS.length - 1]);
+    if (!nextEmoji) return;
+    const trimmed = nextEmoji.trim();
+    if (!trimmed) return;
+    persistCustomReactionEmoji(Array.from(trimmed)[0]);
+  }
+
+  function canUseSpecialMessageMode() {
+    if (!currentUser || typeof window === "undefined") return true;
+    const today = new Date().toISOString().slice(0, 10);
+    const key = getSessionKey("special_message_quota");
+    try {
+      const raw = JSON.parse(localStorage.getItem(key) || "{}");
+      const used = raw?.date === today ? Number(raw.count || 0) : 0;
+      if (used >= SPECIAL_MESSAGE_DAILY_LIMIT) {
+        setComposerStatus(`Timed and one-time messages are limited to ${SPECIAL_MESSAGE_DAILY_LIMIT} per day.`);
+        return false;
+      }
+      localStorage.setItem(key, JSON.stringify({ date: today, count: used + 1 }));
+      return true;
+    } catch {
+      localStorage.setItem(key, JSON.stringify({ date: today, count: 1 }));
+      return true;
+    }
+  }
+
   function checkMessageRateLimit() {
     const now = Date.now();
     const recent = messageSendTimesRef.current.filter((value) => now - value < MESSAGE_RATE_WINDOW_MS);
@@ -571,7 +1016,10 @@ export default function App() {
 
   function openChat(chatId) {
     setSelectedChatId(chatId);
-    if (isMobileLayout) setMobileScreen("chat");
+    if (isMobileLayout) {
+      setMobileScreen("chat");
+      setMobileNavSection("messages");
+    }
     setMobileSubgroupsOpen(false);
   }
 
@@ -622,17 +1070,21 @@ export default function App() {
   }
 
   function openAddFriendPopup() {
+    playAppSound("open");
     setShowAddFriend(true);
     setShowCreateGroup(false);
     setShowNotifications(false);
     setShowProfile(false);
+    setShowGamesMenu(false);
   }
 
   function openCreateGroupPopup() {
+    playAppSound("open");
     setShowCreateGroup(true);
     setShowAddFriend(false);
     setShowNotifications(false);
     setShowProfile(false);
+    setShowGamesMenu(false);
     setGroupStep("select");
     setSelectedGroupMemberIds([]);
     setGroupNameDraft("");
@@ -641,26 +1093,58 @@ export default function App() {
   }
 
   function openNotificationPopup() {
+    playAppSound("open");
     setShowNotifications(true);
     setShowAddFriend(false);
     setShowCreateGroup(false);
     setShowProfile(false);
+    setShowGamesMenu(false);
   }
 
   function openProfilePopup() {
+    playAppSound("open");
     setShowProfile(true);
     setShowAddFriend(false);
     setShowCreateGroup(false);
     setShowNotifications(false);
+    setShowGamesMenu(false);
+  }
+
+  function openGamesPopup() {
+    playAppSound("open");
+    setShowGamesMenu(true);
+    setShowAddFriend(false);
+    setShowCreateGroup(false);
+    setShowNotifications(false);
+    setShowProfile(false);
+    setShowEventScheduler(false);
+    setGameStatus("");
+  }
+
+  function showGameToastMessage(message) {
+    setGameToast(message);
+  }
+
+  function openGameOverlay() {
+    if (!activeGame) return;
+    playAppSound("open");
+    setShowGameOverlay(true);
+  }
+
+  function closeGameOverlay() {
+    setShowGameOverlay(false);
+    setShowGameCloseOptions(false);
   }
 
   function openEventSchedulerPopup() {
     if (!selectedChatId) return;
+    playAppSound("open");
     setShowEventScheduler(true);
     setShowAddFriend(false);
     setShowCreateGroup(false);
     setShowNotifications(false);
     setShowProfile(false);
+    setShowGamesMenu(false);
     setEventTitleDraft("");
     setEventDescriptionDraft("");
     setEventTimeDraft("");
@@ -676,10 +1160,12 @@ export default function App() {
     setShowSavedContent(false);
     setShowUserProfileView(false);
     setShowEventScheduler(false);
+    setShowGamesMenu(false);
     setShowGroupProfile(false);
     setViewedUserId("");
     setGroupProfileStatus("");
     setSubgroupStatus("");
+    setGameStatus("");
   }
 
   function toggleGroupMember(uid) {
@@ -696,11 +1182,13 @@ export default function App() {
 
   function openGroupProfilePopup() {
     if (!selectedChat?.isGroup) return;
+    playAppSound("open");
     setShowGroupProfile(true);
     setShowAddFriend(false);
     setShowCreateGroup(false);
     setShowNotifications(false);
     setShowProfile(false);
+    setShowGamesMenu(false);
     setShowEventScheduler(false);
     setGroupProfileNameDraft(selectedChat.groupName || "");
     setGroupDescriptionDraft(selectedChat.groupDescription || "");
@@ -709,6 +1197,346 @@ export default function App() {
     setSubgroupStatus("");
     setSelectedSubgroupMemberIds([]);
     setMemberToAddId("");
+  }
+
+  async function startChatGame(type) {
+    if (!selectedChat || !currentUser) return;
+    const canStartGame =
+      type === GAME_TYPES.ludo
+        ? canUseLudoInChat
+        : canUseGamesInChat;
+    if (!canStartGame) {
+      setGameStatus(
+        type === GAME_TYPES.ludo
+          ? "Ludo works in direct chats or in groups with exactly 4 members."
+          : "Games are available in direct chats only.",
+      );
+      return;
+    }
+    if (activeGame || hasPendingGameInvite) {
+      setGameStatus("Only one game can be active or pending in this chat.");
+      showGameToastMessage("Finish or decide the current game request first.");
+      return;
+    }
+    if (!Object.values(GAME_TYPES).includes(type)) {
+      setGameStatus("Unsupported game type.");
+      return;
+    }
+
+    try {
+      await addDoc(collection(db, "chats", selectedChat.id, "messages"), {
+        senderId: currentUser.uid,
+        senderName: username,
+        createdAt: serverTimestamp(),
+        text: `${username} invited you to ${formatGameTypeLabel(type)}.`,
+        isGameInvite: true,
+        gameType: type,
+        inviteStatus: "pending",
+      });
+      await updateDoc(doc(db, "chats", selectedChat.id), {
+        lastMessage: `[Game Invite] ${formatGameTypeLabel(type)}`,
+        lastSenderId: currentUser.uid,
+        updatedAt: serverTimestamp(),
+      });
+      setShowGamesMenu(false);
+      setGameStatus("");
+      setMobileScreen("chat");
+    } catch {
+      setGameStatus("Failed to send game invite.");
+    }
+  }
+
+  async function acceptGameInvite(message) {
+    if (!selectedChat || !currentUser || !message?.id || !message.gameType) return;
+    if (message.inviteStatus !== "pending") return;
+    if (activeGame) {
+      setGameStatus("Only one game can be active in this chat.");
+      return;
+    }
+    try {
+      const gamePlayers =
+        message.gameType === GAME_TYPES.ludo && selectedChat.isGroup
+          ? (selectedChat.members || []).slice(0, 4)
+          : (selectedChat.members || []);
+      const session = createGameSession(message.gameType, gamePlayers, message.senderId || currentUser.uid);
+      const chatRef = doc(db, "chats", selectedChat.id);
+      const inviteRef = doc(db, "chats", selectedChat.id, "messages", message.id);
+      await updateDoc(chatRef, {
+        activeGame: {
+          ...session,
+          inviteMessageId: message.id,
+          acceptedBy: currentUser.uid,
+        },
+        lastMessage: `[Game] ${formatGameTypeLabel(message.gameType)} started`,
+        lastSenderId: currentUser.uid,
+        updatedAt: serverTimestamp(),
+      });
+      await updateDoc(inviteRef, {
+        inviteStatus: "accepted",
+        acceptedBy: currentUser.uid,
+        acceptedAt: serverTimestamp(),
+        gameSessionId: session.sessionId,
+      });
+      await addDoc(collection(db, "chats", selectedChat.id, "messages"), {
+        senderId: "",
+        senderName: "Game",
+        createdAt: serverTimestamp(),
+        text: `${formatGameTypeLabel(message.gameType)} started`,
+        isGameSession: true,
+        gameType: message.gameType,
+        gameSessionId: session.sessionId,
+        gameStartedBy: message.senderId || currentUser.uid,
+      });
+      setGameStatus("");
+    } catch {
+      setGameStatus("Failed to accept game invite.");
+    }
+  }
+
+  async function declineGameInvite(message) {
+    if (!selectedChat || !message?.id || message.inviteStatus !== "pending") return;
+    try {
+      await updateDoc(doc(db, "chats", selectedChat.id, "messages", message.id), {
+        inviteStatus: "declined",
+        declinedAt: serverTimestamp(),
+      });
+      await syncChatLastMessage(selectedChat.id).catch(() => {});
+      setGameStatus("");
+      showGameToastMessage("Game invite declined.");
+    } catch {
+      setGameStatus("Failed to decline game invite.");
+    }
+  }
+
+  async function closeActiveGame() {
+    if (!selectedChatId || !activeGame) return;
+    try {
+      setShowGameOverlay(false);
+      setShowGameCloseOptions(false);
+      await updateDoc(doc(db, "chats", selectedChatId), {
+        activeGame: null,
+        updatedAt: serverTimestamp(),
+      });
+    } catch {
+      setGameStatus("Failed to close the game.");
+    }
+  }
+
+  async function requestCloseActiveGame() {
+    if (!selectedChatId || !activeGame || !currentUser) return;
+    try {
+      await updateDoc(doc(db, "chats", selectedChatId), {
+        "activeGame.closeRequestBy": currentUser.uid,
+        "activeGame.closeRequestedAt": serverTimestamp(),
+        "activeGame.updatedAt": serverTimestamp(),
+      });
+      setShowGameCloseOptions(false);
+      setGameStatus("Close request sent.");
+    } catch {
+      setGameStatus("Failed to send close request.");
+    }
+  }
+
+  async function clearCloseGameRequest() {
+    if (!selectedChatId || !activeGame) return;
+    try {
+      await updateDoc(doc(db, "chats", selectedChatId), {
+        "activeGame.closeRequestBy": "",
+        "activeGame.closeRequestedAt": null,
+        "activeGame.updatedAt": serverTimestamp(),
+      });
+      setGameStatus("");
+    } catch {
+      setGameStatus("Failed to update close request.");
+    }
+  }
+
+  async function acceptCloseGameRequest() {
+    await closeActiveGame();
+  }
+
+  async function playTicTacToe(index) {
+    if (!selectedChatId || !currentUser || activeGame?.type !== GAME_TYPES.tictactoe || activeGame?.status !== "active") return;
+    try {
+      await runTransaction(db, async (transaction) => {
+        const chatRef = doc(db, "chats", selectedChatId);
+        const snapshot = await transaction.get(chatRef);
+        const chatData = snapshot.data() || {};
+        const game = chatData.activeGame;
+        if (!game || game.type !== GAME_TYPES.tictactoe || game.status !== "active") return;
+        if (game.turn !== currentUser.uid) return;
+        const board = Array.isArray(game.board) ? [...game.board] : Array(9).fill("");
+        if (board[index] || game.winner) return;
+        const symbol = game.marks?.[currentUser.uid] || "X";
+        board[index] = symbol;
+        const winnerState = getTicTacToeWinner(board);
+        const filled = board.every(Boolean);
+        const nextPlayer = (game.players || []).find((uid) => uid !== currentUser.uid) || currentUser.uid;
+
+        transaction.update(chatRef, {
+          "activeGame.board": board,
+          "activeGame.turn": winnerState || filled ? "" : nextPlayer,
+          "activeGame.status": winnerState || filled ? "finished" : "active",
+          "activeGame.winner": winnerState
+            ? currentUser.uid
+            : filled
+              ? "draw"
+              : "",
+          "activeGame.winnerLine": winnerState?.line || [],
+          "activeGame.updatedAt": serverTimestamp(),
+        });
+      });
+    } catch {
+      setGameStatus("Move failed.");
+    }
+  }
+
+  async function playRps(choice) {
+    if (!selectedChatId || !currentUser || activeGame?.type !== GAME_TYPES.rps || activeGame?.status !== "active") return;
+    if (!RPS_CHOICES.includes(choice)) return;
+    try {
+      await runTransaction(db, async (transaction) => {
+        const chatRef = doc(db, "chats", selectedChatId);
+        const snapshot = await transaction.get(chatRef);
+        const chatData = snapshot.data() || {};
+        const game = chatData.activeGame;
+        if (!game || game.type !== GAME_TYPES.rps || game.status !== "active") return;
+        const picks = { ...(game.picks || {}), [currentUser.uid]: choice };
+        const players = Array.isArray(game.players) ? game.players : [];
+        const allPicked = players.length === 2 && players.every((uid) => Boolean(picks[uid]));
+        const outcome = allPicked ? getRpsWinner(picks, players) : null;
+        transaction.update(chatRef, {
+          "activeGame.picks": picks,
+          "activeGame.status": allPicked ? "finished" : "active",
+          "activeGame.winner": outcome?.winner || "",
+          "activeGame.resultText": outcome?.resultText || "",
+          "activeGame.updatedAt": serverTimestamp(),
+        });
+      });
+    } catch {
+      setGameStatus("Pick failed.");
+    }
+  }
+
+  async function rollLudoDice() {
+    if (!selectedChatId || !currentUser || activeGame?.type !== GAME_TYPES.ludo || activeGame?.status !== "active") return;
+    try {
+      await runTransaction(db, async (transaction) => {
+        const chatRef = doc(db, "chats", selectedChatId);
+        const snapshot = await transaction.get(chatRef);
+        const chatData = snapshot.data() || {};
+        const game = chatData.activeGame;
+        if (!game || game.type !== GAME_TYPES.ludo || game.status !== "active") return;
+        if (game.turn !== currentUser.uid || game.currentRoll) return;
+
+        const roll = Math.floor(Math.random() * 6) + 1;
+        const myTokens = Array.isArray(game.tokens?.[currentUser.uid]) ? game.tokens[currentUser.uid] : Array(LUDO_TOKEN_COUNT).fill(-1);
+        const movable = getLudoMovableTokenIndexes(myTokens, roll);
+        if (movable.length === 0) {
+          const nextPlayer = getNextLudoPlayer(game.players || [], currentUser.uid);
+          transaction.update(chatRef, {
+            "activeGame.lastRoll": roll,
+            "activeGame.currentRoll": 0,
+            "activeGame.turn": nextPlayer,
+            "activeGame.resultText": `Rolled ${roll}. No valid move.`,
+            "activeGame.updatedAt": serverTimestamp(),
+          });
+          return;
+        }
+
+        transaction.update(chatRef, {
+          "activeGame.lastRoll": roll,
+          "activeGame.currentRoll": roll,
+          "activeGame.resultText": `Rolled ${roll}. Pick a token.`,
+          "activeGame.updatedAt": serverTimestamp(),
+        });
+      });
+    } catch {
+      setGameStatus("Dice roll failed.");
+    }
+  }
+
+  async function moveLudoToken(tokenIndex) {
+    if (!selectedChatId || !currentUser || activeGame?.type !== GAME_TYPES.ludo || activeGame?.status !== "active") return;
+    try {
+      await runTransaction(db, async (transaction) => {
+        const chatRef = doc(db, "chats", selectedChatId);
+        const snapshot = await transaction.get(chatRef);
+        const chatData = snapshot.data() || {};
+        const game = chatData.activeGame;
+        if (!game || game.type !== GAME_TYPES.ludo || game.status !== "active") return;
+        if (game.turn !== currentUser.uid || !game.currentRoll) return;
+
+        const players = Array.isArray(game.players) ? game.players : [];
+        const myTokens = Array.isArray(game.tokens?.[currentUser.uid]) ? [...game.tokens[currentUser.uid]] : Array(LUDO_TOKEN_COUNT).fill(-1);
+        const movable = getLudoMovableTokenIndexes(myTokens, game.currentRoll);
+        if (!movable.includes(tokenIndex)) return;
+
+        const updatedMyTokens = moveLudoTokenState(myTokens, tokenIndex, game.currentRoll);
+        const landingSpot = updatedMyTokens[tokenIndex];
+        const currentPlayerIndex = players.findIndex((uid) => uid === currentUser.uid);
+        const tokensUpdate = {
+          ...(game.tokens || {}),
+          [currentUser.uid]: updatedMyTokens,
+        };
+        let captured = false;
+        if (landingSpot >= 0 && landingSpot < LUDO_OUTER_TRACK_LENGTH) {
+          const landingBoardCell = getLudoBoardCell(landingSpot, currentPlayerIndex);
+          for (const playerId of players) {
+            if (!playerId || playerId === currentUser.uid) continue;
+            const playerIndex = players.findIndex((uid) => uid === playerId);
+            const otherTokens = Array.isArray(game.tokens?.[playerId]) ? [...game.tokens[playerId]] : Array(LUDO_TOKEN_COUNT).fill(-1);
+            for (let index = 0; index < otherTokens.length; index += 1) {
+              const opponentSpot = otherTokens[index];
+              const opponentBoardCell =
+                opponentSpot >= 0 && opponentSpot < LUDO_OUTER_TRACK_LENGTH
+                  ? getLudoBoardCell(opponentSpot, playerIndex)
+                  : null;
+              if (
+                landingBoardCell &&
+                opponentBoardCell &&
+                opponentBoardCell[0] === landingBoardCell[0] &&
+                opponentBoardCell[1] === landingBoardCell[1]
+              ) {
+                otherTokens[index] = -1;
+                captured = true;
+              }
+            }
+            tokensUpdate[playerId] = otherTokens;
+          }
+        }
+
+        const finishedCounts = { ...(game.finishedCounts || {}) };
+        finishedCounts[currentUser.uid] = updatedMyTokens.filter((position) => position === LUDO_FINISH_INDEX).length;
+        const didWin = finishedCounts[currentUser.uid] >= LUDO_TOKEN_COUNT;
+        const keepTurn = game.currentRoll === 6 && !didWin;
+        const nextPlayer = keepTurn ? currentUser.uid : getNextLudoPlayer(players, currentUser.uid);
+
+        transaction.update(chatRef, {
+          "activeGame.tokens": tokensUpdate,
+          "activeGame.finishedCounts": finishedCounts,
+          "activeGame.currentRoll": 0,
+          "activeGame.turn": didWin ? "" : nextPlayer,
+          "activeGame.status": didWin ? "finished" : "active",
+          "activeGame.winner": didWin ? currentUser.uid : "",
+          "activeGame.resultText": didWin
+            ? "Both tokens reached home."
+            : captured
+              ? "Captured an opponent token."
+              : keepTurn
+                ? "Rolled 6. Take another turn."
+                : `Moved token ${tokenIndex + 1}.`,
+          "activeGame.updatedAt": serverTimestamp(),
+        });
+      });
+    } catch {
+      setGameStatus("Move failed.");
+    }
+  }
+
+  async function restartActiveGame() {
+    if (!selectedChat || !currentUser || !activeGame?.type) return;
+    await startChatGame(activeGame.type);
   }
 
   function pushBrowserNotification(title, body) {
@@ -737,6 +1565,93 @@ export default function App() {
       const notification = new Notification(title, { body });
       setTimeout(() => notification.close(), 6000);
     } catch {}
+  }
+
+  function playAppSound(kind) {
+    if (!soundEnabled || soundVolume <= 0) return;
+    if (typeof window === "undefined") return;
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return;
+    try {
+      if (!gameAudioContextRef.current) {
+        gameAudioContextRef.current = new AudioContextClass();
+      }
+      const context = gameAudioContextRef.current;
+      if (context.state === "suspended") {
+        context.resume().catch(() => {});
+      }
+      const masterGain = context.createGain();
+      masterGain.connect(context.destination);
+      masterGain.gain.value = 0.045 * soundVolume;
+      const now = context.currentTime;
+      const soundMap = {
+        open: { steps: [410, 560], type: "sine", duration: 0.08, gap: 0.05, volume: 0.45 },
+        send: { steps: [320, 420, 580], type: "sine", duration: 0.08, gap: 0.05, volume: 0.5 },
+        event: { steps: [392, 523.25, 659.25], type: "triangle", duration: 0.11, gap: 0.08, volume: 0.5 },
+        success: { steps: [440, 554.37, 659.25], type: "sine", duration: 0.09, gap: 0.06, volume: 0.5 },
+        accept: { steps: [392, 493.88, 587.33], type: "sine", duration: 0.09, gap: 0.06, volume: 0.52 },
+        decline: { steps: [370, 293.66], type: "triangle", duration: 0.1, gap: 0.07, volume: 0.45 },
+        copy: { steps: [660], type: "square", duration: 0.06, gap: 0.05, volume: 0.35 },
+        delete: { steps: [260, 180], type: "triangle", duration: 0.09, gap: 0.07, volume: 0.45 },
+        lock: { steps: [330, 262], type: "triangle", duration: 0.1, gap: 0.07, volume: 0.45 },
+        unlock: { steps: [262, 330, 440], type: "sine", duration: 0.08, gap: 0.05, volume: 0.45 },
+        error: { steps: [240, 180, 140], type: "sawtooth", duration: 0.09, gap: 0.06, volume: 0.35 },
+        dice: { steps: [220, 280, 340], type: "sine", duration: 0.12, gap: 0.08, volume: 0.8 },
+        move: { steps: [420, 520], type: "sine", duration: 0.12, gap: 0.08, volume: 0.8 },
+        win: { steps: [523.25, 659.25, 783.99], type: "sine", duration: 0.12, gap: 0.08, volume: 0.8 },
+        lose: { steps: [392, 311.13, 220], type: "sine", duration: 0.12, gap: 0.08, volume: 0.8 },
+        shake: { steps: [180, 160, 180], type: "triangle", duration: 0.12, gap: 0.08, volume: 0.8 },
+        reveal: { steps: [330, 392, 494], type: "sine", duration: 0.12, gap: 0.08, volume: 0.8 },
+      };
+      const preset = soundMap[kind] || soundMap.open;
+
+      preset.steps.forEach((frequency, index) => {
+        const oscillator = context.createOscillator();
+        const gainNode = context.createGain();
+        const startAt = now + index * preset.gap;
+        oscillator.type = preset.type;
+        oscillator.frequency.setValueAtTime(frequency, startAt);
+        gainNode.gain.setValueAtTime(0.0001, startAt);
+        gainNode.gain.exponentialRampToValueAtTime(preset.volume, startAt + 0.01);
+        gainNode.gain.exponentialRampToValueAtTime(0.0001, startAt + preset.duration);
+        oscillator.connect(gainNode);
+        gainNode.connect(masterGain);
+        oscillator.start(startAt);
+        oscillator.stop(startAt + preset.duration + 0.01);
+      });
+    } catch {
+      // Audio is optional.
+    }
+  }
+
+  function playGameSound(kind) {
+    playAppSound(kind);
+  }
+
+  async function updateSoundPreferences(nextEnabled, nextVolume) {
+    const normalizedVolume = Math.min(1, Math.max(0, Number(nextVolume)));
+    setSoundEnabled(Boolean(nextEnabled));
+    setSoundVolume(normalizedVolume);
+
+    if (typeof window !== "undefined") {
+      localStorage.setItem("textinger_sound_enabled", nextEnabled ? "1" : "0");
+      localStorage.setItem("textinger_sound_volume", `${normalizedVolume}`);
+    }
+
+    if (!currentUser) return;
+    try {
+      await setDoc(
+        doc(db, "users", currentUser.uid),
+        {
+          soundEnabled: Boolean(nextEnabled),
+          soundVolume: normalizedVolume,
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true },
+      );
+    } catch {
+      // Sound preferences can stay local if sync fails.
+    }
   }
 
   async function ensureOneSignalLoaded() {
@@ -819,6 +1734,10 @@ export default function App() {
       setFcmStatus("Sign in first, then enable push notifications.");
       return;
     }
+    if (IS_NATIVE_APP) {
+      await enableNativePushNotificationsForCurrentUser();
+      return;
+    }
 
     const vapidKey = import.meta.env.VITE_FIREBASE_VAPID_KEY;
     if (!vapidKey) {
@@ -856,7 +1775,30 @@ export default function App() {
     setFcmStatus("Push notifications enabled on this device.");
   }
 
+  async function enableNativePushNotificationsForCurrentUser() {
+    if (!currentUser || !IS_NATIVE_APP) return;
+    try {
+      let permission = await PushNotifications.checkPermissions();
+      if (permission.receive === "prompt") {
+        permission = await PushNotifications.requestPermissions();
+      }
+      setNotificationPermission(permission.receive || "default");
+      if (permission.receive !== "granted") {
+        setFcmStatus("Native notification permission was not granted.");
+        return;
+      }
+      await PushNotifications.register();
+      setFcmStatus("Native push registration requested.");
+    } catch {
+      setFcmStatus("Native push setup failed.");
+    }
+  }
+
   async function requestNotificationPermission() {
+    if (IS_NATIVE_APP) {
+      await enableNativePushNotificationsForCurrentUser();
+      return;
+    }
     if (typeof Notification === "undefined") {
       setNotificationPermission("unsupported");
       setFcmStatus("Notifications are not supported in this browser.");
@@ -900,10 +1842,23 @@ export default function App() {
 
   useEffect(() => {
     if (typeof window === "undefined") return undefined;
-    const updateLayout = () => setIsMobileLayout(window.innerWidth <= MOBILE_BREAKPOINT);
+    const updateLayout = () => setIsMobileLayout(IS_NATIVE_MOBILE_APP || window.innerWidth <= MOBILE_BREAKPOINT);
     updateLayout();
     window.addEventListener("resize", updateLayout);
     return () => window.removeEventListener("resize", updateLayout);
+  }, []);
+
+  useEffect(() => {
+    if (!IS_NATIVE_MOBILE_APP || socialLoginInitRef.current) return;
+    socialLoginInitRef.current = true;
+    SocialLogin.initialize({
+      google: {
+        webClientId: GOOGLE_WEB_CLIENT_ID,
+        mode: "online",
+      },
+    }).catch(() => {
+      socialLoginInitRef.current = false;
+    });
   }, []);
 
   useEffect(() => {
@@ -921,16 +1876,82 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!IS_NATIVE_APP) return undefined;
+    const registrationListener = PushNotifications.addListener("registration", async (token) => {
+      if (!currentUser || !token?.value) return;
+      try {
+        await setDoc(
+          doc(db, "users", currentUser.uid),
+          {
+            fcmTokens: arrayUnion(token.value),
+            nativePushTokens: arrayUnion(token.value),
+            nativePushPlatform: Capacitor.getPlatform(),
+            pushEnabledAt: serverTimestamp(),
+          },
+          { merge: true },
+        );
+        setFcmStatus("Native push token saved for this device.");
+      } catch {
+        setFcmStatus("Native push token was received but could not be saved.");
+      }
+    });
+
+    const registrationErrorListener = PushNotifications.addListener("registrationError", () => {
+      setFcmStatus("Native push registration failed.");
+    });
+
+    const receivedListener = PushNotifications.addListener("pushNotificationReceived", (notification) => {
+      const title = notification?.title || "Textinger";
+      const body = notification?.body || "You have a new message.";
+      setMobileMessageToast({
+        chatId: notification?.data?.chatId || "",
+        title,
+        preview: body,
+      });
+    });
+
+    const actionListener = PushNotifications.addListener("pushNotificationActionPerformed", (event) => {
+      const chatId = event?.notification?.data?.chatId || "";
+      if (chatId) {
+        openChat(chatId);
+      }
+    });
+
+    return () => {
+      registrationListener.then((handle) => handle.remove()).catch(() => {});
+      registrationErrorListener.then((handle) => handle.remove()).catch(() => {});
+      receivedListener.then((handle) => handle.remove()).catch(() => {});
+      actionListener.then((handle) => handle.remove()).catch(() => {});
+    };
+  }, [currentUser]);
+
+  useEffect(() => {
     if (!currentUser) {
       if (window.OneSignal && oneSignalReadyRef.current) {
         window.OneSignal.logout().catch(() => {});
       }
       setFcmStatus("");
+      soundPrefsHydratedRef.current = false;
       return;
     }
     if (notificationPermission !== "granted") return;
     enablePushNotificationsForCurrentUser().catch(() => {});
   }, [currentUser, notificationPermission]);
+
+  useEffect(() => {
+    if (!currentUser || !userProfile || soundPrefsHydratedRef.current) return;
+    const nextEnabled = typeof userProfile.soundEnabled === "boolean" ? userProfile.soundEnabled : soundEnabled;
+    const nextVolume = Number.isFinite(Number(userProfile.soundVolume))
+      ? Math.min(1, Math.max(0, Number(userProfile.soundVolume)))
+      : soundVolume;
+    soundPrefsHydratedRef.current = true;
+    setSoundEnabled(nextEnabled);
+    setSoundVolume(nextVolume);
+    if (typeof window !== "undefined") {
+      localStorage.setItem("textinger_sound_enabled", nextEnabled ? "1" : "0");
+      localStorage.setItem("textinger_sound_volume", `${nextVolume}`);
+    }
+  }, [currentUser, userProfile, soundEnabled, soundVolume]);
 
   useEffect(() => {
     if (notificationPermission !== "granted") return undefined;
@@ -1119,8 +2140,184 @@ export default function App() {
     setRecoveryAnswerDraft("");
     setNewPinDraft("");
     setReplyingTo(null);
+    setShowGamesMenu(false);
+    setGameStatus("");
     forceScrollToBottomRef.current = true;
   }, [selectedChatId]);
+
+  useEffect(() => {
+    if (!gameToast) return undefined;
+    const timer = setTimeout(() => setGameToast(""), 2600);
+    return () => clearTimeout(timer);
+  }, [gameToast]);
+
+  useEffect(() => {
+    setShowGameOverlay(false);
+  }, [selectedChatId]);
+
+  useEffect(() => {
+    if (!activeGameStartsAtMs || activeGame?.status !== "countdown") return undefined;
+    setGameNowMs(Date.now());
+    const interval = setInterval(() => setGameNowMs(Date.now()), 250);
+    return () => clearInterval(interval);
+  }, [activeGame?.status, activeGameStartsAtMs]);
+
+  useEffect(() => {
+    if (!selectedChatId || !activeGame || activeGame.status !== "countdown" || !activeGameStartsAtMs) return undefined;
+    const remainingMs = activeGameStartsAtMs - Date.now();
+    if (remainingMs <= 0) {
+      updateDoc(doc(db, "chats", selectedChatId), {
+        "activeGame.status": "active",
+        "activeGame.updatedAt": serverTimestamp(),
+      }).catch(() => {});
+      return undefined;
+    }
+    const timer = setTimeout(() => {
+      updateDoc(doc(db, "chats", selectedChatId), {
+        "activeGame.status": "active",
+        "activeGame.updatedAt": serverTimestamp(),
+      }).catch(() => {});
+    }, remainingMs + 40);
+    return () => clearTimeout(timer);
+  }, [activeGame, activeGameStartsAtMs, selectedChatId]);
+
+  useEffect(() => {
+    if (!activeGame) {
+      if (ludoAnimationTimerRef.current) {
+        clearTimeout(ludoAnimationTimerRef.current);
+        ludoAnimationTimerRef.current = null;
+      }
+      setAnimatedLudoTokens(null);
+      ludoRenderedTokensRef.current = null;
+      previousGameSnapshotRef.current = null;
+      setShowGameOverlay(false);
+      return;
+    }
+
+    const previous = previousGameSnapshotRef.current;
+    if (!previous || previous.sessionId !== activeGame.sessionId) {
+      previousGameSnapshotRef.current = activeGame;
+      setShowGameOverlay(true);
+      return;
+    }
+
+    if (activeGame.type === GAME_TYPES.ludo && previous.lastRoll !== activeGame.lastRoll && activeGame.lastRoll) {
+      setDiceAnimating(true);
+      playGameSound("dice");
+      setTimeout(() => setDiceAnimating(false), 700);
+    }
+
+    if (activeGame.type === GAME_TYPES.ludo && JSON.stringify(previous.tokens || {}) !== JSON.stringify(activeGame.tokens || {})) {
+      playGameSound("move");
+    }
+
+    if (activeGame.type === GAME_TYPES.rps) {
+      const previousPickCount = countTruthyValues(previous.picks);
+      const nextPickCount = countTruthyValues(activeGame.picks);
+      if (nextPickCount > previousPickCount) {
+        setRpsRevealTick(Date.now());
+        playGameSound(nextPickCount >= 2 ? "reveal" : "shake");
+      }
+    }
+
+    if (previous.winner !== activeGame.winner && activeGame.winner) {
+      playGameSound(activeGame.winner === currentUser?.uid ? "win" : "lose");
+    }
+
+    previousGameSnapshotRef.current = activeGame;
+  }, [activeGame]);
+
+  useEffect(() => {
+    if (activeGame?.type !== GAME_TYPES.ludo) {
+      if (ludoAnimationTimerRef.current) {
+        clearTimeout(ludoAnimationTimerRef.current);
+        ludoAnimationTimerRef.current = null;
+      }
+      setAnimatedLudoTokens(null);
+      ludoRenderedTokensRef.current = null;
+      return undefined;
+    }
+
+    const players = Array.isArray(activeGame.players) ? activeGame.players : [];
+    const targetTokens = cloneGameTokens(activeGame.tokens, players);
+    const previousTokens = ludoRenderedTokensRef.current || targetTokens;
+
+    let changedPlayerId = "";
+    let changedTokenIndex = -1;
+    let fromPosition = -1;
+    let toPosition = -1;
+
+    for (const uid of players) {
+      const prevList = previousTokens?.[uid] || [];
+      const nextList = targetTokens?.[uid] || [];
+      for (let index = 0; index < Math.max(prevList.length, nextList.length); index += 1) {
+        if ((prevList[index] ?? -1) !== (nextList[index] ?? -1)) {
+          changedPlayerId = uid;
+          changedTokenIndex = index;
+          fromPosition = prevList[index] ?? -1;
+          toPosition = nextList[index] ?? -1;
+          break;
+        }
+      }
+      if (changedPlayerId) break;
+    }
+
+    if (!changedPlayerId || toPosition < fromPosition || toPosition === -1) {
+      setAnimatedLudoTokens(targetTokens);
+      ludoRenderedTokensRef.current = targetTokens;
+      return undefined;
+    }
+
+    if (ludoAnimationTimerRef.current) {
+      clearTimeout(ludoAnimationTimerRef.current);
+      ludoAnimationTimerRef.current = null;
+    }
+
+    setAnimatedLudoTokens(previousTokens);
+    const path = [];
+    if (fromPosition === -1 && toPosition >= 0) {
+      path.push(0);
+      for (let step = 1; step <= toPosition; step += 1) {
+        path.push(step);
+      }
+    } else {
+      for (let step = fromPosition + 1; step <= toPosition; step += 1) {
+        path.push(step);
+      }
+    }
+
+    let stepIndex = 0;
+    const tick = () => {
+      setAnimatedLudoTokens((currentTokens) => {
+        const base = cloneGameTokens(currentTokens || previousTokens, players);
+        base[changedPlayerId][changedTokenIndex] = path[Math.min(stepIndex, path.length - 1)];
+        ludoRenderedTokensRef.current = cloneGameTokens(base, players);
+        return base;
+      });
+      stepIndex += 1;
+      if (stepIndex < path.length) {
+        ludoAnimationTimerRef.current = setTimeout(tick, 170);
+      } else {
+        ludoAnimationTimerRef.current = null;
+        setAnimatedLudoTokens(targetTokens);
+        ludoRenderedTokensRef.current = targetTokens;
+      }
+    };
+
+    if (path.length > 0) {
+      ludoAnimationTimerRef.current = setTimeout(tick, 90);
+    } else {
+      setAnimatedLudoTokens(targetTokens);
+      ludoRenderedTokensRef.current = targetTokens;
+    }
+
+    return () => {
+      if (ludoAnimationTimerRef.current) {
+        clearTimeout(ludoAnimationTimerRef.current);
+        ludoAnimationTimerRef.current = null;
+      }
+    };
+  }, [activeGame?.type, activeGame?.tokens, activeGame?.players, activeGame?.sessionId]);
 
   useEffect(() => {
     if (!selectedChatId) return undefined;
@@ -1128,8 +2325,33 @@ export default function App() {
     const unsub = onSnapshot(
       query(collection(db, "chats", selectedChatId, "messages"), orderBy("createdAt", "asc")),
       (snapshot) => {
-        setMessages(snapshot.docs.map((d) => ({ id: d.id, ...d.data() })));
+        const nextMessages = [];
+        const expiredIds = [];
+        const now = Date.now();
+        for (const entry of snapshot.docs) {
+          const message = { id: entry.id, ...entry.data() };
+          const expiresAtMs = message.expiresAt?.toMillis?.() || 0;
+          if (expiresAtMs && expiresAtMs <= now) {
+            if (!message.timedOut) {
+              expiredIds.push(entry.id);
+            }
+            nextMessages.push({
+              ...message,
+              timedOut: true,
+              text: "",
+              mediaURL: "",
+              mediaType: "",
+              mediaName: "",
+            });
+            continue;
+          }
+          nextMessages.push(message);
+        }
+        setMessages(nextMessages);
         setMessagesLoading(false);
+        if (expiredIds.length > 0) {
+          applyTimedOutMessages(selectedChatId, expiredIds).catch(() => {});
+        }
       },
       () => {
         setMessagesLoading(false);
@@ -1137,6 +2359,37 @@ export default function App() {
     );
     return () => unsub();
   }, [selectedChatId]);
+
+  useEffect(() => {
+    if (!selectedChatId || messages.length === 0) return undefined;
+    const pendingExpirations = messages
+      .map((message) => ({
+        id: message.id,
+        expiresAtMs: message.expiresAt?.toMillis?.() || 0,
+        timedOut: Boolean(message.timedOut),
+      }))
+      .filter((message) => message.expiresAtMs > Date.now() && !message.timedOut)
+      .sort((a, b) => a.expiresAtMs - b.expiresAtMs);
+
+    if (pendingExpirations.length === 0) return undefined;
+
+    const nextExpiration = pendingExpirations[0];
+    const delay = Math.max(0, nextExpiration.expiresAtMs - Date.now());
+    const timer = setTimeout(() => {
+      const now = Date.now();
+      const expiredNow = messages
+        .filter((message) => {
+          const expiresAtMs = message.expiresAt?.toMillis?.() || 0;
+          return expiresAtMs > 0 && expiresAtMs <= now && !message.timedOut;
+        })
+        .map((message) => message.id);
+      if (expiredNow.length > 0) {
+        applyTimedOutMessages(selectedChatId, expiredNow).catch(() => {});
+      }
+    }, delay + 20);
+
+    return () => clearTimeout(timer);
+  }, [selectedChatId, messages]);
 
   useEffect(() => {
     if (!selectedChatId || !messagesRef.current) return;
@@ -1246,6 +2499,16 @@ export default function App() {
   }, [openMessageMenuId]);
 
   useEffect(() => {
+    if (!openReactionPickerId) return undefined;
+    const handleGlobalClick = () => {
+      if (Date.now() < reactionPickerLockUntilRef.current) return;
+      setOpenReactionPickerId("");
+    };
+    document.addEventListener("click", handleGlobalClick);
+    return () => document.removeEventListener("click", handleGlobalClick);
+  }, [openReactionPickerId]);
+
+  useEffect(() => {
     if (!attachMenuOpen) return undefined;
     const handleGlobalClick = () => setAttachMenuOpen(false);
     document.addEventListener("click", handleGlobalClick);
@@ -1286,6 +2549,12 @@ export default function App() {
       setChatLocks({});
     }
     setUnlockedChatIds([]);
+  }, [currentUser]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const key = currentUser ? getSessionKey("custom_reaction_emoji") : "textinger_custom_reaction_emoji_guest";
+    setCustomReactionEmoji(localStorage.getItem(key) || "");
   }, [currentUser]);
 
   useEffect(() => {
@@ -1371,6 +2640,17 @@ export default function App() {
     }, 6000);
     return () => clearTimeout(timer);
   }, [mobileMessageToast]);
+
+  useEffect(() => {
+    if (!viewOnceOverlay) return undefined;
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== "visible") {
+        closeViewOnceOverlay().catch(() => {});
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
+  }, [viewOnceOverlay, selectedChatId, currentUser]);
 
   useEffect(() => {
     if (!mobileMessageToast) return;
@@ -1502,6 +2782,7 @@ export default function App() {
 
   function toggleBlockedUser(userId) {
     if (!userId) return;
+    playAppSound(blockedUserIds.includes(userId) ? "unlock" : "lock");
     setBlockedUserIds((prev) =>
       prev.includes(userId) ? prev.filter((id) => id !== userId) : [...prev, userId],
     );
@@ -1509,6 +2790,7 @@ export default function App() {
 
   function toggleMutedUser(userId) {
     if (!userId) return;
+    playAppSound(mutedUserIds.includes(userId) ? "unlock" : "lock");
     setMutedUserIds((prev) =>
       prev.includes(userId) ? prev.filter((id) => id !== userId) : [...prev, userId],
     );
@@ -1522,6 +2804,7 @@ export default function App() {
       const enteredPin = window.prompt("Enter current PIN to permanently unlock this chat:");
       if (!enteredPin) return;
       if (enteredPin.trim() !== lockConfig.pin) {
+        playAppSound("error");
         setProfileStatus("Incorrect PIN. Could not unlock chat permanently.");
         return;
       }
@@ -1531,17 +2814,20 @@ export default function App() {
         return next;
       });
       setUnlockedChatIds((prev) => prev.filter((id) => id !== chatId));
+      playAppSound("unlock");
       setProfileStatus("Chat lock removed permanently.");
       return;
     }
     const pin = window.prompt("Set a 4-digit PIN for this chat lock:");
     if (!pin) return;
     if (!/^\d{4}$/.test(pin.trim())) {
+      playAppSound("error");
       setProfileStatus("PIN must be exactly 4 digits.");
       return;
     }
     const answer = window.prompt("Security question setup: What is your best friend name?");
     if (!answer?.trim()) {
+      playAppSound("error");
       setProfileStatus("Security answer is required to enable chat lock.");
       return;
     }
@@ -1553,6 +2839,7 @@ export default function App() {
       },
     }));
     setUnlockedChatIds((prev) => (prev.includes(chatId) ? prev : [...prev, chatId]));
+    playAppSound("lock");
     setProfileStatus("Chat lock enabled.");
   }
 
@@ -1561,10 +2848,12 @@ export default function App() {
     const lockConfig = getChatLockConfig(chatLocks, selectedChatId);
     if (!lockConfig) return;
     if (unlockPinDraft.trim() !== lockConfig.pin) {
+      playAppSound("error");
       setUnlockStatus("Incorrect PIN.");
       return;
     }
     setUnlockedChatIds((prev) => (prev.includes(selectedChatId) ? prev : [...prev, selectedChatId]));
+    playAppSound("unlock");
     setUnlockPinDraft("");
     setUnlockStatus("");
   }
@@ -1575,10 +2864,12 @@ export default function App() {
     if (!lockConfig) return;
     const normalized = recoveryAnswerDraft.trim().toLowerCase();
     if (!normalized || normalized !== lockConfig.recoveryAnswer) {
+      playAppSound("error");
       setUnlockStatus("Incorrect answer for recovery question.");
       return;
     }
     if (!/^\d{4}$/.test(newPinDraft.trim())) {
+      playAppSound("error");
       setUnlockStatus("Set a valid new 4-digit PIN.");
       return;
     }
@@ -1590,6 +2881,7 @@ export default function App() {
       },
     }));
     setUnlockedChatIds((prev) => (prev.includes(selectedChatId) ? prev : [...prev, selectedChatId]));
+    playAppSound("unlock");
     setUnlockStatus("PIN reset successful. Chat unlocked.");
     setShowRecovery(false);
     setRecoveryAnswerDraft("");
@@ -1611,22 +2903,74 @@ export default function App() {
     }
 
     const latest = latestSnap.docs[0].data();
-    const nextLastMessage =
-      latest.text ||
-      (latest.mediaType?.startsWith("image/")
-        ? "Photo"
-        : latest.mediaType?.startsWith("video/")
-          ? "Video"
-          : latest.mediaType?.startsWith("audio/")
-            ? "Audio"
-            : latest.mediaURL
-              ? "File"
-              : "No messages yet");
+    const nextLastMessage = buildMessagePreviewLabel(latest);
     await updateDoc(doc(db, "chats", chatId), {
       lastMessage: nextLastMessage,
       lastSenderId: latest.senderId || "",
       updatedAt: serverTimestamp(),
     });
+  }
+
+  async function applyTimedOutMessages(chatId, messageIds) {
+    if (!chatId || !Array.isArray(messageIds) || messageIds.length === 0) return;
+    const uniqueIds = Array.from(new Set(messageIds.filter(Boolean)));
+    if (uniqueIds.length === 0) return;
+
+    setMessages((prev) =>
+      prev.map((message) =>
+        uniqueIds.includes(message.id)
+          ? {
+              ...message,
+              timedOut: true,
+              text: "",
+              mediaURL: "",
+              mediaType: "",
+              mediaName: "",
+            }
+          : message,
+      ),
+    );
+
+    setChats((prev) =>
+      prev.map((chat) => {
+        if (chat.id !== chatId) return chat;
+        const latestVisibleMessage = [...messages]
+          .map((message) =>
+            uniqueIds.includes(message.id)
+              ? {
+                  ...message,
+                  timedOut: true,
+                  text: "",
+                  mediaURL: "",
+                  mediaType: "",
+                  mediaName: "",
+                }
+              : message,
+          )
+          .sort((a, b) => (a.createdAt?.toMillis?.() || 0) - (b.createdAt?.toMillis?.() || 0))
+          .at(-1);
+        return latestVisibleMessage
+          ? {
+              ...chat,
+              lastMessage: buildMessagePreviewLabel(latestVisibleMessage),
+            }
+          : chat;
+      }),
+    );
+
+    await Promise.all(
+      uniqueIds.map((messageId) =>
+        updateDoc(doc(db, "chats", chatId, "messages", messageId), {
+          timedOut: true,
+          text: "",
+          mediaURL: "",
+          mediaType: "",
+          mediaName: "",
+          timedOutAt: serverTimestamp(),
+        }).catch(() => {}),
+      ),
+    );
+    await syncChatLastMessage(chatId).catch(() => {});
   }
 
   async function handleAuthSubmit(event) {
@@ -1729,8 +3073,125 @@ export default function App() {
       }
 
       setAuthForm({ email, password: "", username: "" });
+      playAppSound("success");
     } catch (error) {
+      playAppSound("error");
       setAuthError(normalizeAuthError(error));
+    } finally {
+      setBusyLabel("");
+    }
+  }
+
+  async function handleGoogleSignIn() {
+    setAuthError("");
+    setCapacityError("");
+    const provider = new GoogleAuthProvider();
+    provider.setCustomParameters({ prompt: "select_account" });
+    const usersRef = collection(db, "users");
+
+    try {
+      setBusyLabel("Signing in with Google...");
+      let cred;
+      if (IS_NATIVE_MOBILE_APP) {
+        if (!socialLoginInitRef.current) {
+          await SocialLogin.initialize({
+            google: {
+              webClientId: GOOGLE_WEB_CLIENT_ID,
+              mode: "online",
+            },
+          });
+          socialLoginInitRef.current = true;
+        }
+        const nativeResult = await SocialLogin.login({
+          provider: "google",
+          options: {
+            scopes: ["email", "profile"],
+            filterByAuthorizedAccounts: false,
+          },
+        });
+        const idToken = nativeResult?.result?.responseType === "online" ? nativeResult.result.idToken : "";
+        if (!idToken) {
+          throw new Error("Native Google sign-in did not return an ID token.");
+        }
+        cred = await signInWithCredential(auth, GoogleAuthProvider.credential(idToken));
+      } else {
+        cred = await signInWithPopup(auth, provider);
+      }
+      const existingUserSnap = await getDoc(doc(db, "users", cred.user.uid));
+      const isFirstLogin = !existingUserSnap.exists();
+
+      if (isFirstLogin) {
+        try {
+          const onlineUsersSnap = await getDocs(
+            query(usersRef, where("isOnline", "==", true), limit(MAX_TOTAL_USERS)),
+          );
+          const activeCutoff = Date.now() - ACTIVE_WINDOW_MS;
+          const activeUserIds = new Set(
+            onlineUsersSnap.docs
+              .filter((entry) => toMillis(entry.data()?.lastActiveAt) >= activeCutoff)
+              .map((entry) => entry.id),
+          );
+          const totalUsersSnap = await getCountFromServer(usersRef);
+          const totalUsers = totalUsersSnap.data().count || 0;
+          const activeWithoutCurrent = activeUserIds.has(cred.user.uid)
+            ? activeUserIds.size - 1
+            : activeUserIds.size;
+
+          if (totalUsers >= MAX_TOTAL_USERS || activeWithoutCurrent >= MAX_ACTIVE_USERS) {
+            await deleteUser(cred.user).catch(() => {});
+            await signOut(auth).catch(() => {});
+            if (totalUsers >= MAX_TOTAL_USERS) {
+              setCapacityError(`Signup closed: max ${MAX_TOTAL_USERS} accounts reached.`);
+            } else {
+              setCapacityError(`Try later: max ${MAX_ACTIVE_USERS} active users reached.`);
+            }
+            return;
+          }
+        } catch (capacityError) {
+          if (!isPermissionDenied(capacityError)) throw capacityError;
+        }
+      } else {
+        try {
+          const onlineUsersSnap = await getDocs(
+            query(usersRef, where("isOnline", "==", true), limit(MAX_TOTAL_USERS)),
+          );
+          const activeCutoff = Date.now() - ACTIVE_WINDOW_MS;
+          const activeUserIds = new Set(
+            onlineUsersSnap.docs
+              .filter((entry) => toMillis(entry.data()?.lastActiveAt) >= activeCutoff)
+              .map((entry) => entry.id),
+          );
+          const isAlreadyActive = activeUserIds.has(cred.user.uid);
+          if (!isAlreadyActive && activeUserIds.size >= MAX_ACTIVE_USERS) {
+            await signOut(auth).catch(() => {});
+            setCapacityError(`Try later: max ${MAX_ACTIVE_USERS} active users reached.`);
+            return;
+          }
+        } catch (capacityError) {
+          if (!isPermissionDenied(capacityError)) throw capacityError;
+        }
+      }
+
+      const displayName = `${cred.user.displayName || authForm.username || cred.user.email?.split("@")[0] || "User"}`.trim();
+      await setDoc(
+        doc(db, "users", cred.user.uid),
+        {
+          email: (cred.user.email || "").toLowerCase(),
+          emailLower: (cred.user.email || "").toLowerCase(),
+          username: displayName,
+          bio: existingUserSnap.data()?.bio || "",
+          photoURL: cred.user.photoURL || existingUserSnap.data()?.photoURL || "",
+          isOnline: true,
+          lastActiveAt: serverTimestamp(),
+          createdAt: existingUserSnap.data()?.createdAt || serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true },
+      );
+      playAppSound("success");
+    } catch (error) {
+      playAppSound("error");
+      setAuthError(normalizeAuthError(error) === "Authentication failed." ? "Google sign-in failed." : normalizeAuthError(error));
     } finally {
       setBusyLabel("");
     }
@@ -1748,29 +3209,26 @@ export default function App() {
     try {
       setBusyLabel("Sending reset email...");
       await sendPasswordResetEmail(auth, email);
+      playAppSound("success");
       setForgotStatus("If this email is registered, a password reset mail has been sent.");
     } catch {
+      playAppSound("error");
       setForgotStatus("Unable to process reset right now. Please try again.");
     } finally {
       setBusyLabel("");
     }
   }
 
+  async function handleLogout() {
+    playAppSound("decline");
+    await signOut(auth);
+  }
+
   async function sendPayload(payload, options = {}) {
     if (!selectedChat || !currentUser) return;
     await addDoc(collection(db, "chats", selectedChat.id, "messages"), payload);
-    const lastMessage =
-      options.lastMessage ||
-      payload.text ||
-      (payload.mediaType?.startsWith("image/")
-        ? "Photo"
-        : payload.mediaType?.startsWith("video/")
-          ? "Video"
-          : payload.mediaType?.startsWith("audio/")
-            ? "Audio"
-            : payload.mediaURL
-              ? "File"
-              : "No messages yet");
+    playAppSound(payload?.isEvent ? "event" : "send");
+    const lastMessage = options.lastMessage || buildMessagePreviewLabel(payload);
     await updateDoc(doc(db, "chats", selectedChat.id), {
       lastMessage,
       lastSenderId: payload.senderId || currentUser.uid,
@@ -1804,6 +3262,7 @@ export default function App() {
       setComposerStatus("Upload blocked: file must be 7MB or smaller.");
       return;
     }
+    if (messageMode.type !== "normal" && !canUseSpecialMessageMode()) return;
     if (!checkMessageRateLimit()) return;
 
     setSending(true);
@@ -1830,12 +3289,18 @@ export default function App() {
         mediaType,
         mediaName,
         mediaSize,
+        viewOnce: messageMode.type === "viewOnce",
+        expiresAt:
+          messageMode.type === "timed" && messageMode.durationMs > 0
+            ? Timestamp.fromDate(new Date(Date.now() + messageMode.durationMs))
+            : null,
         createdAt: serverTimestamp(),
       });
 
       await sendPayload(payload);
       setText("");
       setReplyingTo(null);
+      resetMessageMode();
       typingTextRef.current = "";
       await clearTypingState();
       setMediaFile(null);
@@ -1856,6 +3321,7 @@ export default function App() {
     if (!name?.trim()) return;
     const phone = window.prompt("Contact phone number");
     if (!phone?.trim()) return;
+    if (messageMode.type !== "normal" && !canUseSpecialMessageMode()) return;
     setBusyLabel("Sending contact...");
     try {
       await sendPayload(
@@ -1866,11 +3332,17 @@ export default function App() {
           messageType: "contact",
           contactName: name.trim(),
           contactPhone: phone.trim(),
+          viewOnce: messageMode.type === "viewOnce",
+          expiresAt:
+            messageMode.type === "timed" && messageMode.durationMs > 0
+              ? Timestamp.fromDate(new Date(Date.now() + messageMode.durationMs))
+              : null,
           createdAt: serverTimestamp(),
         }),
-        { lastMessage: `Contact: ${name.trim()}` },
+        { lastMessage: messageMode.type === "normal" ? `Contact: ${name.trim()}` : undefined },
       );
       setReplyingTo(null);
+      resetMessageMode();
       setAttachMenuOpen(false);
     } finally {
       setBusyLabel("");
@@ -1887,6 +3359,7 @@ export default function App() {
       setComposerStatus("Location is not supported in this browser.");
       return;
     }
+    if (messageMode.type !== "normal" && !canUseSpecialMessageMode()) return;
     setBusyLabel("Fetching location...");
     try {
       const position = await new Promise((resolve, reject) => {
@@ -1905,11 +3378,17 @@ export default function App() {
           text: `Location: ${mapsURL}`,
           messageType: "location",
           location: { latitude, longitude },
+          viewOnce: messageMode.type === "viewOnce",
+          expiresAt:
+            messageMode.type === "timed" && messageMode.durationMs > 0
+              ? Timestamp.fromDate(new Date(Date.now() + messageMode.durationMs))
+              : null,
           createdAt: serverTimestamp(),
         }),
-        { lastMessage: "Location shared" },
+        { lastMessage: messageMode.type === "normal" ? "Location shared" : undefined },
       );
       setReplyingTo(null);
+      resetMessageMode();
       setAttachMenuOpen(false);
     } catch {
       setComposerStatus("Unable to fetch location.");
@@ -1951,8 +3430,10 @@ export default function App() {
       });
 
       setFriendStatus("Friend request sent.");
+      playAppSound("success");
       setFriendEmail("");
     } catch (error) {
+      playAppSound("error");
       setFriendStatus(error.message || "Failed to send request.");
     } finally {
       setBusyLabel("");
@@ -1977,6 +3458,7 @@ export default function App() {
           { merge: true },
         );
       }
+      playAppSound(status === "accepted" ? "accept" : "decline");
     } finally {
       setBusyLabel("");
     }
@@ -2001,8 +3483,10 @@ export default function App() {
         { photoURL: url, updatedAt: serverTimestamp() },
         { merge: true },
       );
+      playAppSound("success");
       setProfileStatus("Profile picture updated.");
     } catch (error) {
+      playAppSound("error");
       setProfileStatus(error.message || "Failed to update picture.");
     } finally {
       setBusyLabel("");
@@ -2027,8 +3511,10 @@ export default function App() {
         { username: nextName, bio: nextBio, updatedAt: serverTimestamp() },
         { merge: true },
       );
+      playAppSound("success");
       setProfileStatus("Profile updated.");
     } catch (error) {
+      playAppSound("error");
       setProfileStatus(error.message || "Failed to update profile.");
     } finally {
       setBusyLabel("");
@@ -2057,6 +3543,7 @@ export default function App() {
         editedAt: serverTimestamp(),
       });
       await syncChatLastMessage(selectedChatId);
+      playAppSound("success");
       cancelEditMessage();
     } finally {
       setBusyLabel("");
@@ -2072,6 +3559,7 @@ export default function App() {
     try {
       await deleteDoc(doc(db, "chats", selectedChatId, "messages", messageId));
       await syncChatLastMessage(selectedChatId);
+      playAppSound("delete");
     } finally {
       setBusyLabel("");
     }
@@ -2082,9 +3570,59 @@ export default function App() {
     if (!content) return;
     try {
       await navigator.clipboard.writeText(content);
+      playAppSound("copy");
       setOpenMessageMenuId("");
     } catch {
+      playAppSound("error");
       setOpenMessageMenuId("");
+    }
+  }
+
+  async function toggleReaction(messageId, emoji, hasReacted) {
+    if (!selectedChatId || !currentUser || !emoji) return;
+    try {
+      await updateDoc(doc(db, "chats", selectedChatId, "messages", messageId), {
+        [`reactions.${emoji}`]: hasReacted ? arrayRemove(currentUser.uid) : arrayUnion(currentUser.uid),
+      });
+      playAppSound(hasReacted ? "decline" : "accept");
+    } finally {
+      setOpenMessageMenuId("");
+      setOpenReactionPickerId("");
+    }
+  }
+
+  async function openViewOnceMessage(msg) {
+    if (!selectedChatId || !currentUser || !msg?.id) return;
+    setOpenedViewOnceMessageIds((prev) => (prev.includes(msg.id) ? prev : [...prev, msg.id]));
+    setViewOnceOverlay({
+      messageId: msg.id,
+      senderId: msg.senderId || "",
+      senderName: msg.senderName || msg.user || "User",
+      text: msg.text || "",
+      mediaURL: msg.mediaURL || "",
+      mediaType: msg.mediaType || "",
+      mediaName: msg.mediaName || "",
+    });
+    playAppSound("open");
+  }
+
+  async function closeViewOnceOverlay() {
+    if (!selectedChatId || !viewOnceOverlay) {
+      setViewOnceOverlay(null);
+      return;
+    }
+    const shouldConsume = viewOnceOverlay.senderId !== currentUser?.uid;
+    const messageId = viewOnceOverlay.messageId;
+    setViewOnceOverlay(null);
+    if (!shouldConsume || !messageId) return;
+
+    setBusyLabel("Closing one-time message...");
+    try {
+      await deleteDoc(doc(db, "chats", selectedChatId, "messages", messageId));
+      await syncChatLastMessage(selectedChatId);
+      playAppSound("delete");
+    } finally {
+      setBusyLabel("");
     }
   }
 
@@ -2114,9 +3652,11 @@ export default function App() {
         },
         { merge: true },
       );
+      playAppSound("success");
       setSavedStatus("Message saved.");
       setOpenMessageMenuId("");
     } catch (error) {
+      playAppSound("error");
       setSavedStatus(error.message || "Failed to save message.");
     } finally {
       setBusyLabel("");
@@ -2126,6 +3666,7 @@ export default function App() {
   async function removeSavedMessage(savedId) {
     if (!currentUser) return;
     await deleteDoc(doc(db, "users", currentUser.uid, "savedMessages", savedId));
+    playAppSound("delete");
   }
 
   async function createGroupChat() {
@@ -2172,9 +3713,11 @@ export default function App() {
       });
 
       openChat(groupRef.id);
+      playAppSound("success");
       setGroupStatus("Group created.");
       closePopups();
     } catch (error) {
+      playAppSound("error");
       setGroupStatus(error.message || "Failed to create group.");
     } finally {
       setBusyLabel("");
@@ -2202,8 +3745,10 @@ export default function App() {
         groupDescription: groupDescriptionDraft.trim(),
         updatedAt: serverTimestamp(),
       });
+      playAppSound("success");
       setGroupProfileStatus("Group profile updated.");
     } catch (error) {
+      playAppSound("error");
       setGroupProfileStatus(error.message || "Failed to update group profile.");
     } finally {
       setBusyLabel("");
@@ -2240,8 +3785,10 @@ export default function App() {
         });
       });
       setMemberToAddId("");
+      playAppSound("success");
       setGroupProfileStatus("Member added.");
     } catch (error) {
+      playAppSound("error");
       setGroupProfileStatus(error.message || "Failed to add member.");
     } finally {
       setBusyLabel("");
@@ -2278,8 +3825,10 @@ export default function App() {
           updatedAt: serverTimestamp(),
         });
       });
+      playAppSound("delete");
       setGroupProfileStatus("Member removed.");
     } catch (error) {
+      playAppSound("error");
       setGroupProfileStatus(error.message || "Failed to remove member.");
     } finally {
       setBusyLabel("");
@@ -2313,8 +3862,10 @@ export default function App() {
           updatedAt: serverTimestamp(),
         });
       });
+      playAppSound("success");
       setGroupProfileStatus("Role updated.");
     } catch (error) {
+      playAppSound("error");
       setGroupProfileStatus(error.message || "Failed to update role.");
     } finally {
       setBusyLabel("");
@@ -2365,8 +3916,10 @@ export default function App() {
       });
       setSubgroupNameDraft("");
       setSelectedSubgroupMemberIds([]);
+      playAppSound("success");
       setSubgroupStatus("Subgroup created.");
     } catch (error) {
+      playAppSound("error");
       setSubgroupStatus(error.message || "Failed to create subgroup.");
     } finally {
       setBusyLabel("");
@@ -2397,13 +3950,579 @@ export default function App() {
         nextEventCreatedBy: currentUser.uid,
         nextEventUpdatedAt: serverTimestamp(),
       });
+      playAppSound("event");
       setEventStatus("Event scheduled.");
       setShowEventScheduler(false);
     } catch (error) {
+      playAppSound("error");
       setEventStatus(error.message || "Failed to schedule event.");
     } finally {
       setBusyLabel("");
     }
+  }
+
+  function renderTicTacToeCard() {
+    if (!activeGame) return null;
+    const board = Array.isArray(activeGame.board) ? activeGame.board : Array(9).fill("");
+    const currentMark = activeGame.marks?.[currentUser?.uid] || "";
+    const opponentMark = activeGame.marks?.[gameOpponentId] || "";
+    const statusText =
+      activeGame.status === "countdown"
+        ? `Starting in ${activeGameCountdown}s`
+        : activeGame.winner === "draw"
+          ? "Draw game."
+          : activeGame.status === "finished" && activeGame.winner
+            ? `${activeGame.winner === currentUser?.uid ? "You" : activeGameOpponent?.username || "Opponent"} won.`
+            : activeGame.turn === currentUser?.uid
+              ? "Your turn."
+              : `${activeGameOpponent?.username || "Opponent"} is playing.`;
+
+    return (
+      <section className={`chatGameCard ${activeGame.status === "countdown" ? "countdown" : ""}`}>
+        <div className="chatGameHead">
+          <div>
+            <span className="chatGameEyebrow">Live game</span>
+            <h3>{formatGameTypeLabel(activeGame.type)}</h3>
+            <p>{statusText}</p>
+          </div>
+          <div className="chatGameHeadActions">
+            <span className="chatGameBadge">You: {currentMark || "-"}</span>
+            <span className="chatGameBadge">{activeGameOpponent?.username || "Opponent"}: {opponentMark || "-"}</span>
+          </div>
+        </div>
+        {renderGameCloseNotice()}
+        <div className="ticTacToeBoard">
+          {board.map((cell, index) => (
+            <button
+              type="button"
+              key={`cell_${index}`}
+              className={`ticTacToeCell ${activeGame.winnerLine?.includes(index) ? "winnerCell" : ""}`}
+              disabled={activeGame.status !== "active" || activeGame.turn !== currentUser?.uid || Boolean(cell)}
+              onClick={() => playTicTacToe(index)}
+            >
+              {cell || "·"}
+            </button>
+          ))}
+        </div>
+        <div className="chatGameFooter">
+          {activeGame.status === "finished" ? (
+            <button type="button" className="ghost" onClick={restartActiveGame}>
+              Rematch
+            </button>
+          ) : (
+            <small>Leave the chat and come back later. The board stays here until someone closes it.</small>
+          )}
+          {renderGameFooterActions()}
+        </div>
+      </section>
+    );
+  }
+
+  function renderRpsCard() {
+    if (!activeGame) return null;
+    const myPick = activeGame.picks?.[currentUser?.uid] || "";
+    const opponentPick = activeGame.status === "finished" ? activeGame.picks?.[gameOpponentId] || "" : "";
+    const shouldShake = activeGame.status === "active" && countTruthyValues(activeGame.picks) < 2;
+    const shouldReveal = activeGame.status === "finished" || rpsRevealTick > 0;
+    const myHand = shouldReveal ? (myPick || "rock") : "rock";
+    const opponentHand = shouldReveal ? (opponentPick || "rock") : "rock";
+    const handIcon = {
+      rock: "✊",
+      paper: "✋",
+      scissors: "✌",
+    };
+    const resultLabel =
+      activeGame.status === "countdown"
+        ? `Starting in ${activeGameCountdown}s`
+        : activeGame.status === "finished"
+          ? activeGame.winner === "draw"
+            ? activeGame.resultText || "Draw."
+            : `${activeGame.winner === currentUser?.uid ? "You won." : `${activeGameOpponent?.username || "Opponent"} won.`} ${activeGame.resultText || ""}`.trim()
+          : myPick
+            ? `You picked ${myPick}. Waiting for ${activeGameOpponent?.username || "opponent"}.`
+            : "Choose your move.";
+
+    return (
+      <section className={`chatGameCard ${activeGame.status === "countdown" ? "countdown" : ""}`}>
+        <div className="chatGameHead">
+          <div>
+            <span className="chatGameEyebrow">Live game</span>
+            <h3>{formatGameTypeLabel(activeGame.type)}</h3>
+            <p>{resultLabel}</p>
+          </div>
+          <div className="chatGameHeadActions">
+            <span className="chatGameBadge">You: {myPick || "..."}</span>
+            <span className="chatGameBadge">{activeGameOpponent?.username || "Opponent"}: {opponentPick || (activeGame.status === "finished" ? "..." : "Hidden")}</span>
+          </div>
+        </div>
+        {renderGameCloseNotice()}
+        <div className="rpsStage">
+          <div className={`rpsHandCard left ${shouldShake ? "shaking" : ""} ${shouldReveal ? "revealed" : ""}`}>
+            <span className="rpsPlayerLabel">You</span>
+            <div className="rpsHand">{handIcon[myHand]}</div>
+          </div>
+          <div className="rpsVsPill">VS</div>
+          <div className={`rpsHandCard right ${shouldShake ? "shaking" : ""} ${shouldReveal ? "revealed" : ""}`}>
+            <span className="rpsPlayerLabel">{activeGameOpponent?.username || "Opponent"}</span>
+            <div className="rpsHand">{handIcon[opponentHand]}</div>
+          </div>
+        </div>
+        <div className="rpsGrid">
+          {RPS_CHOICES.map((choice) => (
+            <button
+              type="button"
+              key={choice}
+              className={`rpsChoice ${myPick === choice ? "active" : ""}`}
+              disabled={activeGame.status !== "active" || Boolean(myPick)}
+              onClick={() => playRps(choice)}
+            >
+              <strong>{choice}</strong>
+            </button>
+          ))}
+        </div>
+        <div className="chatGameFooter">
+          {activeGame.status === "finished" ? (
+            <button type="button" className="ghost" onClick={restartActiveGame}>
+              Play again
+            </button>
+          ) : (
+            <small>Your pick stays hidden until both players commit.</small>
+          )}
+          {renderGameFooterActions()}
+        </div>
+      </section>
+    );
+  }
+
+  function renderLudoCard() {
+    if (!activeGame || !currentUser) return null;
+    const playerIds = Array.isArray(activeGame.players) ? activeGame.players : [];
+    const displayedTokens = animatedLudoTokens || activeGame.tokens || {};
+    const myTokens = Array.isArray(displayedTokens?.[currentUser.uid]) ? displayedTokens[currentUser.uid] : Array(LUDO_TOKEN_COUNT).fill(-1);
+    const movable = activeGame.turn === currentUser.uid ? getLudoMovableTokenIndexes(myTokens, activeGame.currentRoll) : [];
+    const activeTurnName =
+      activeGame.turn === currentUser.uid
+        ? "Your"
+        : usersById.get(activeGame.turn)?.username || "Player";
+    const winnerName =
+      activeGame.winner === currentUser.uid
+        ? "You"
+        : usersById.get(activeGame.winner)?.username || "Player";
+    const statusText =
+      activeGame.status === "countdown"
+        ? `Starting in ${activeGameCountdown}s`
+        : activeGame.status === "finished"
+          ? `${winnerName} won. ${activeGame.resultText || ""}`.trim()
+          : activeGame.turn === currentUser.uid
+            ? activeGame.currentRoll
+              ? `Rolled ${activeGame.currentRoll}. Choose a token.`
+              : "Your turn. Roll the dice."
+            : `${activeTurnName} is taking a turn.`;
+
+    return (
+      <section className={`chatGameCard ${activeGame.status === "countdown" ? "countdown" : ""}`}>
+        <div className="chatGameHead">
+          <div>
+            <span className="chatGameEyebrow">Live game</span>
+            <h3>{formatGameTypeLabel(activeGame.type)}</h3>
+            <p>{statusText}</p>
+          </div>
+          <div className="chatGameHeadActions">
+            {playerIds.map((playerId, index) => (
+              <span key={`ludo_badge_${playerId}`} className={`chatGameBadge ludoBadge ludoBadge${index}`}>
+                {(playerId === currentUser.uid ? "You" : usersById.get(playerId)?.username || `Player ${index + 1}`)} home: {activeGame.finishedCounts?.[playerId] || 0}/{LUDO_TOKEN_COUNT}
+              </span>
+            ))}
+          </div>
+        </div>
+        {renderGameCloseNotice()}
+        <div className="ludoBoard">
+          <div className="ludoBoardMap">
+            <img src="/games/ludo-board.svg" alt="Ludo board" className="ludoBoardImage" />
+            {playerIds.flatMap((playerId, playerIndex) => {
+              const playerTokens = Array.isArray(displayedTokens?.[playerId]) ? displayedTokens[playerId] : Array(LUDO_TOKEN_COUNT).fill(-1);
+              return playerTokens.map((position, index) => {
+                const coords = getLudoTokenCoords(position, index, playerIndex);
+                const isMe = playerId === currentUser.uid;
+                const isMovable = isMe && movable.includes(index);
+                const tokenLabel = isMe ? `Your token ${index + 1}` : `${usersById.get(playerId)?.username || `Player ${playerIndex + 1}`} token ${index + 1}`;
+                if (isMe) {
+                  return (
+                    <button
+                      type="button"
+                      key={`ludo_piece_${playerId}_${index}`}
+                      className={`ludoPiece ludoPiece${playerIndex} ${isMovable ? "active" : ""}`}
+                      style={{ left: `${coords.x}%`, top: `${coords.y}%` }}
+                      disabled={!isMovable}
+                      onClick={() => moveLudoToken(index)}
+                      title={tokenLabel}
+                    >
+                      <span>{index + 1}</span>
+                    </button>
+                  );
+                }
+                return (
+                  <span
+                    key={`ludo_piece_${playerId}_${index}`}
+                    className={`ludoPiece ludoPiece${playerIndex}`}
+                    style={{ left: `${coords.x}%`, top: `${coords.y}%` }}
+                    title={tokenLabel}
+                  >
+                    <span>{index + 1}</span>
+                  </span>
+                );
+              });
+            })}
+          </div>
+          <div className="ludoDicePanel">
+            <div className={`ludoDieFace ${activeGame.turn === currentUser.uid && !activeGame.currentRoll && activeGame.status === "active" ? "rollingReady" : ""}`}>
+              {activeGame.currentRoll || activeGame.lastRoll || "?"}
+            </div>
+            <button
+              type="button"
+              disabled={activeGame.status !== "active" || activeGame.turn !== currentUser.uid || Boolean(activeGame.currentRoll)}
+              onClick={rollLudoDice}
+            >
+              Roll Dice
+            </button>
+          </div>
+        </div>
+        <div className="chatGameFooter">
+          <small>{activeGame.resultText || "Roll 6 to bring a token out. Exact roll is needed to reach home."}</small>
+          <div className="chatGameInlineActions">
+            {activeGame.status === "finished" && (
+              <button type="button" className="ghost" onClick={restartActiveGame}>
+                Play again
+              </button>
+            )}
+            {renderGameFooterActions()}
+          </div>
+        </div>
+      </section>
+    );
+  }
+
+  function renderGameCloseNotice() {
+    if (!activeGame || !currentUser) return null;
+    if (!activeGame.closeRequestBy) return null;
+    const requesterName =
+      activeGame.closeRequestBy === currentUser.uid
+        ? "You"
+        : usersById.get(activeGame.closeRequestBy)?.username || "Player";
+    if (activeGame.closeRequestBy === currentUser.uid) {
+      return (
+        <div className="gameCloseNotice">
+          <p>{requesterName} asked to end this game. Waiting for the others.</p>
+          <button type="button" className="ghost" onClick={clearCloseGameRequest}>
+            Cancel Request
+          </button>
+        </div>
+      );
+    }
+    return (
+      <div className="gameCloseNotice">
+        <p>{requesterName} asked to end this game.</p>
+        <div className="gameTemplateActions">
+          <button type="button" onClick={acceptCloseGameRequest}>
+            Accept End
+          </button>
+          <button type="button" className="ghost" onClick={clearCloseGameRequest}>
+            Keep Playing
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  function renderGameFooterActions() {
+    if (!activeGame || !currentUser) return null;
+    const isStarter = activeGame.startedBy === currentUser.uid;
+    const hasPendingCloseRequest = Boolean(activeGame.closeRequestBy);
+    if (activeGame.status === "finished") {
+      return (
+        <button type="button" className="ghost dangerGhost" onClick={closeActiveGame}>
+          End Game
+        </button>
+      );
+    }
+    if (isStarter) {
+      if (showGameCloseOptions) {
+        return (
+          <div className="chatGameInlineActions">
+            <button type="button" className="ghost" onClick={closeGameOverlay}>
+              Close View
+            </button>
+            <button
+              type="button"
+              className="ghost dangerGhost"
+              onClick={requestCloseActiveGame}
+              disabled={hasPendingCloseRequest}
+            >
+              Ask to End
+            </button>
+            <button type="button" className="ghost" onClick={() => setShowGameCloseOptions(false)}>
+              Cancel
+            </button>
+          </div>
+        );
+      }
+      return (
+        <button type="button" className="ghost dangerGhost" onClick={() => setShowGameCloseOptions(true)}>
+          Close
+        </button>
+      );
+    }
+    return (
+      <button type="button" className="ghost dangerGhost" onClick={closeGameOverlay}>
+        Close
+      </button>
+    );
+  }
+
+  function renderActiveGameCard() {
+    if (!activeGame) return null;
+    if (activeGame.type === GAME_TYPES.tictactoe) return renderTicTacToeCard();
+    if (activeGame.type === GAME_TYPES.rps) return renderRpsCard();
+    if (activeGame.type === GAME_TYPES.ludo) return renderLudoCard();
+    return null;
+  }
+
+  function renderNavIcon(type) {
+    if (type === "messages") {
+      return (
+        <span className="navIconWrap" aria-hidden="true">
+          <svg viewBox="0 0 24 24" className="navIconSvg">
+            <path
+              d="M5 6.5a2.5 2.5 0 0 1 2.5-2.5h9A2.5 2.5 0 0 1 19 6.5v6A2.5 2.5 0 0 1 16.5 15H11l-3.8 3.4c-.5.4-1.2.1-1.2-.5V15.2A2.5 2.5 0 0 1 5 12.5z"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.8"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
+        </span>
+      );
+    }
+    if (type === "notifications") {
+      return (
+        <span className="navIconWrap" aria-hidden="true">
+          <svg viewBox="0 0 24 24" className="navIconSvg">
+            <path
+              d="M12 4.5a4 4 0 0 0-4 4v2.2c0 .7-.2 1.4-.6 2l-1.1 1.7c-.4.7.1 1.6.9 1.6h9.6c.8 0 1.3-.9.9-1.6l-1.1-1.7c-.4-.6-.6-1.3-.6-2V8.5a4 4 0 0 0-4-4Z"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.8"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+            <path
+              d="M10.2 17.2a2 2 0 0 0 3.6 0"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.8"
+              strokeLinecap="round"
+            />
+          </svg>
+        </span>
+      );
+    }
+    return (
+      <span className="navProfileWrap">
+        <Avatar
+          name={username}
+          photoURL={userProfile?.photoURL || currentUser?.photoURL || ""}
+          className="navAvatar"
+        />
+        <span className="navPresenceDot" />
+      </span>
+    );
+  }
+
+  function renderUiIcon(type) {
+    if (type === "add-friend") {
+      return (
+        <svg viewBox="0 0 24 24" className="actionIconSvg" aria-hidden="true">
+          <path d="M15 19a5 5 0 0 0-10 0" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+          <circle cx="10" cy="9" r="3.2" fill="none" stroke="currentColor" strokeWidth="1.8" />
+          <path d="M18 8v6M15 11h6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+        </svg>
+      );
+    }
+    if (type === "create-group") {
+      return (
+        <svg viewBox="0 0 24 24" className="actionIconSvg" aria-hidden="true">
+          <circle cx="8" cy="9" r="2.7" fill="none" stroke="currentColor" strokeWidth="1.8" />
+          <circle cx="15.5" cy="8" r="2.2" fill="none" stroke="currentColor" strokeWidth="1.8" />
+          <path d="M4 18a4 4 0 0 1 8 0M13 17.2a3.2 3.2 0 0 1 6.1 0" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+        </svg>
+      );
+    }
+    return null;
+  }
+
+  function renderNotificationsContent(showClose = true) {
+    return (
+      <>
+        <div className="popupHead">
+          <h3>Friend Requests</h3>
+          {showClose && (
+            <button type="button" className="ghost" onClick={closePopups}>
+              Close
+            </button>
+          )}
+        </div>
+        <div className="notifyTools">
+          <p className="muted">Browser alerts: {notificationPermission}</p>
+          <p className="muted">
+            Cloud messaging: {notificationPermission === "granted" ? "Access is granted" : fcmStatus || "not configured"}
+          </p>
+          {notificationPermission !== "granted" && (
+            <button type="button" className="ghost" onClick={() => requestNotificationPermission().catch(() => {})}>
+              Enable Push Notifications
+            </button>
+          )}
+        </div>
+        {requests.length === 0 && <p className="muted">No pending requests.</p>}
+        <div className="requestList">
+          {requests.map((request) => (
+            <article key={request.id} className="requestCard">
+              <p>{request.fromUsername} sent you a request.</p>
+              <div className="requestActions">
+                <button type="button" onClick={() => respondToRequest(request, "accepted")}>
+                  Accept
+                </button>
+                <button
+                  type="button"
+                  className="ghost"
+                  onClick={() => respondToRequest(request, "declined")}
+                >
+                  Decline
+                </button>
+              </div>
+            </article>
+          ))}
+        </div>
+      </>
+    );
+  }
+
+  function renderProfileContent(showClose = true) {
+    return (
+      <>
+        <div className="popupHead">
+          <h3>Profile</h3>
+          {showClose && (
+            <button type="button" className="ghost" onClick={closePopups}>
+              Close
+            </button>
+          )}
+        </div>
+        <div className="profileCard">
+          <div className="profileAvatarWrap">
+            {userProfile?.photoURL || currentUser.photoURL ? (
+              <img
+                src={userProfile?.photoURL || currentUser.photoURL}
+                alt="Profile"
+                className="profileAvatar"
+              />
+            ) : (
+              <div className="profileAvatarFallback">{initials(username)}</div>
+            )}
+            {isCurrentUserOnline && <span className="profileOnlineDot" aria-label="Online" />}
+          </div>
+          <p>
+            <strong>Username:</strong> {username}{" "}
+            <span className={`userStatusText ${isCurrentUserOnline ? "online" : "offline"}`}>
+              {isCurrentUserOnline ? "Online" : "Offline"}
+            </span>
+          </p>
+          <p>
+            <strong>Email:</strong> {currentUser.email}
+          </p>
+          <p>
+            <strong>Bio:</strong> {userProfile?.bio || "No bio yet."}
+          </p>
+          <button
+            type="button"
+            onClick={() => {
+              setProfileNameDraft(username);
+              setProfileBioDraft(userProfile?.bio || "");
+              setShowEditProfile(true);
+            }}
+          >
+            Edit Profile
+          </button>
+          <button type="button" className="ghost" onClick={() => setShowSavedContent(true)}>
+            Saved Content
+          </button>
+          {profileStatus && <small className="muted">{profileStatus}</small>}
+          <button type="button" className="ghost" onClick={() => handleLogout().catch(() => {})}>
+            Logout
+          </button>
+        </div>
+      </>
+    );
+  }
+
+  function renderGameTemplateMessage(message) {
+    if (message.isGameInvite) {
+      const canAccept = message.inviteStatus === "pending" && message.senderId !== currentUser?.uid;
+      const canDecline = message.inviteStatus === "pending" && message.senderId !== currentUser?.uid;
+      return (
+        <article className="gameTemplateStack" key={message.id}>
+          <div className="gameTemplateCard invite">
+            <span className="eventTemplateLabel">Game Invite</span>
+            <strong>{formatGameTypeLabel(message.gameType)}</strong>
+            <p>{message.text || `${message.senderName || "Someone"} invited you to play.`}</p>
+            <small>{formatTime(message.createdAt)}</small>
+            <div className="gameTemplateActions">
+              {canAccept ? (
+                <>
+                  <button type="button" onClick={() => acceptGameInvite(message)}>
+                    Accept
+                  </button>
+                  {canDecline && (
+                    <button type="button" className="ghost" onClick={() => declineGameInvite(message)}>
+                      Decline
+                    </button>
+                  )}
+                </>
+              ) : (
+                <span className="rolePill">
+                  {message.inviteStatus === "accepted" ? "Accepted" : message.inviteStatus === "declined" ? "Declined" : "Pending"}
+                </span>
+              )}
+            </div>
+          </div>
+        </article>
+      );
+    }
+
+    if (message.isGameSession) {
+      const isCurrentSession = activeGame?.sessionId && activeGame.sessionId === message.gameSessionId;
+      return (
+        <article className="gameTemplateStack" key={message.id}>
+          <div className="gameTemplateCard session">
+            <span className="eventTemplateLabel">Game</span>
+            <strong>{formatGameTypeLabel(message.gameType || message.gameSessionType)}</strong>
+            <p>{message.text || "Game session created."}</p>
+            <small>{formatTime(message.createdAt)}</small>
+            <div className="gameTemplateActions">
+              {isCurrentSession ? (
+                <button type="button" onClick={openGameOverlay}>
+                  Open Game
+                </button>
+              ) : (
+                <span className="rolePill">Closed</span>
+              )}
+            </div>
+          </div>
+        </article>
+      );
+    }
+
+    return null;
   }
 
   if (showSplash) {
@@ -2508,6 +4627,19 @@ export default function App() {
               </button>
             )}
           </form>
+          <div className="stack authAltActions">
+            <button type="button" className="googleAuthBtn" onClick={handleGoogleSignIn}>
+              <span className="googleAuthLogo" aria-hidden="true">
+                <svg viewBox="0 0 24 24" focusable="false">
+                  <path fill="#EA4335" d="M12 10.2v3.9h5.5c-.2 1.3-1.5 3.9-5.5 3.9-3.3 0-6-2.7-6-6s2.7-6 6-6c1.9 0 3.2.8 3.9 1.5l2.7-2.6C16.9 3.2 14.7 2.2 12 2.2 6.9 2.2 2.8 6.3 2.8 11.4S6.9 20.6 12 20.6c6.9 0 8.6-4.8 8.6-7.2 0-.5 0-.9-.1-1.3H12z" />
+                  <path fill="#34A853" d="M3.6 7.3l3.2 2.3C7.6 7.7 9.6 6 12 6c1.9 0 3.2.8 3.9 1.5l2.7-2.6C16.9 3.2 14.7 2.2 12 2.2c-3.6 0-6.8 2.1-8.4 5.1z" />
+                  <path fill="#FBBC05" d="M12 20.6c2.6 0 4.8-.9 6.4-2.5l-3-2.4c-.8.6-1.9 1.1-3.4 1.1-3.9 0-5.3-2.6-5.5-3.9l-3.2 2.5c1.6 3 4.7 5.2 8.7 5.2z" />
+                  <path fill="#4285F4" d="M20.6 13.4c0-.5 0-.9-.1-1.3H12v3.9h5.5c-.1.9-.7 2.1-2.1 3l3 2.4c1.8-1.7 2.8-4.1 2.8-8z" />
+                </svg>
+              </span>
+              <span>Continue with Google</span>
+            </button>
+          </div>
 
           {capacityError && <p className="errorText">{capacityError}</p>}
           {authError && <p className="errorText">{authError}</p>}
@@ -2551,18 +4683,77 @@ export default function App() {
   return (
     <>
       <main
-        className={`appShell ${isMobileLayout ? "mobileLayout" : ""} ${mobileScreen === "chat" ? "showMobileChat" : "showMobileList"}`}
+        className={`appShell ${isMobileLayout ? "mobileLayout" : ""} ${mobileScreen === "chat" ? "showMobileChat" : "showMobileList"} ${chatListCollapsed && !isMobileLayout ? "chatListCollapsed" : ""}`}
       >
+        {!isMobileLayout && (
+          <nav className="sideNavRail">
+            <button
+              type="button"
+              className="ghost sideNavBtn active"
+              onClick={() => {
+                closePopups();
+                setMobileNavSection("messages");
+              }}
+              aria-label="Messages"
+              title="Messages"
+            >
+              {renderNavIcon("messages")}
+              <span className="navTextLabel">Messages</span>
+            </button>
+            <button
+              type="button"
+              className={`ghost sideNavBtn ${showNotifications ? "active" : ""}`}
+              onClick={openNotificationPopup}
+              aria-label="Notifications"
+              title="Notifications"
+            >
+              {renderNavIcon("notifications")}
+              <span className="navTextLabel">Notifications</span>
+            </button>
+            <button
+              type="button"
+              className={`ghost sideNavBtn ${showProfile ? "active" : ""}`}
+              onClick={openProfilePopup}
+              aria-label="Profile"
+              title="Profile"
+            >
+              {renderNavIcon("profile")}
+              <span className="navTextLabel">You</span>
+            </button>
+          </nav>
+        )}
+        {isMobileLayout && mobileNavSection !== "messages" ? (
+          <section className="mobileSectionView">
+            <div className="mobileSectionCard">
+              {mobileNavSection === "notifications" ? renderNotificationsContent(false) : renderProfileContent(false)}
+            </div>
+          </section>
+        ) : (
+          <>
         <aside className="sidebar">
         <div className="sidebarTop">
-          <h2>Chats</h2>
+          <div className="sidebarTitleRow">
+            <h2>Chats</h2>
+          </div>
           <div className="sideActions">
-            <button type="button" onClick={openAddFriendPopup}>
-              Add Friend
+            <button
+              type="button"
+              className="sidebarActionBtn iconOnly"
+              onClick={openAddFriendPopup}
+              aria-label="Add friend"
+              title="Add friend"
+            >
+              <span className="actionIconWrap">{renderUiIcon("add-friend")}</span>
             </button>
             {availableGroupFriends.length > 0 && (
-              <button type="button" className="ghost" onClick={openCreateGroupPopup}>
-                Create Group
+              <button
+                type="button"
+                className="ghost sidebarActionBtn iconOnly"
+                onClick={openCreateGroupPopup}
+                aria-label="Create group"
+                title="Create group"
+              >
+                <span className="actionIconWrap">{renderUiIcon("create-group")}</span>
               </button>
             )}
             {isMobileLayout && (
@@ -2574,7 +4765,7 @@ export default function App() {
         </div>
 
         <div className="chatList">
-          {mainChatList.length === 0 && <p className="muted">There is no message here.</p>}
+          {mainChatList.length === 0 && !chatListCollapsed && <p className="muted">There is no message here.</p>}
           {mainChatList.map((chat) => {
             const otherUid = (chat.members || []).find((member) => member !== currentUser.uid);
             const other = otherUid ? usersById.get(otherUid) : null;
@@ -2634,39 +4825,6 @@ export default function App() {
                   {isSelectedUserOnline ? "Online" : "Offline"}
                 </span>
               )}
-              {isMobileLayout && (
-                <span className="mobileInlineActions">
-                  <button
-                    type="button"
-                    className="ghost mobileIconBtn"
-                    onClick={openNotificationPopup}
-                    title="Notifications"
-                    aria-label="Notifications"
-                  >
-                    !
-                  </button>
-                  <button
-                    type="button"
-                    className="ghost mobileIconBtn"
-                    onClick={openProfilePopup}
-                    title="Profile"
-                    aria-label="Profile"
-                  >
-                    @
-                  </button>
-                  {selectedChat?.isGroup && (
-                    <button
-                      type="button"
-                      className="ghost mobileIconBtn"
-                      onClick={() => setMobileSubgroupsOpen((prev) => !prev)}
-                      title="Subgroups"
-                      aria-label="Subgroups"
-                    >
-                      {mobileSubgroupsOpen ? ">" : "<"}
-                    </button>
-                  )}
-                </span>
-              )}
             </h1>
             <small>
               {selectedChat?.isGroup
@@ -2677,22 +4835,10 @@ export default function App() {
             </small>
             </div>
           </div>
-          <div className="topActions">
-            {!isMobileLayout && (
-              <>
-                <button type="button" onClick={openNotificationPopup}>
-                  Notifications {requests.length > 0 ? `(${requests.length})` : ""}
-                </button>
-                <button type="button" onClick={openProfilePopup}>
-                  Profile
-                </button>
-              </>
-            )}
-          </div>
         </header>
 
         <div className={`panelBody ${selectedChat?.isGroup ? "withSubgroups" : ""} ${selectedChatIsLocked ? "chatLocked" : ""}`}>
-        <section className="messageArea">
+        <section className={`messageArea ${activeGame?.status === "countdown" ? "gameCountdownGlow" : ""}`}>
           {selectedChat ? (
             <>
               <div className="messages" ref={messagesRef}>
@@ -2710,6 +4856,24 @@ export default function App() {
                       : senderUser?.photoURL || "";
                   const senderOnline =
                     group.senderId === currentUser.uid ? isCurrentUserOnline : isUserOnline(senderUser);
+                  if (group.items.every((item) => item.isEvent)) {
+                    return (
+                      <article key={group.id} className="eventBubbleStack">
+                        {group.items.map((msg) => (
+                          <div key={msg.id} className="eventMessageCard">
+                            <span className="eventTemplateLabel">Event</span>
+                            <strong>{msg.eventTitle || "Scheduled Event"}</strong>
+                            <p>{msg.eventDescription || msg.text || "Event started."}</p>
+                            <small>{formatTime(msg.createdAt)}</small>
+                          </div>
+                        ))}
+                      </article>
+                    );
+                  }
+                  if (group.items.every((item) => item.isGameInvite || item.isGameSession)) {
+                    return group.items.map((msg) => renderGameTemplateMessage(msg));
+                  }
+
                   return (
                     <article
                       key={group.id}
@@ -2736,8 +4900,31 @@ export default function App() {
                       <div className="groupedMessageStack">
                         {group.items.map((msg) => {
                           const canDeleteMessage = canDeleteGroupMessage(selectedChat, msg, currentUser?.uid);
+                          const isViewOnceLocked = Boolean(msg.viewOnce && msg.senderId !== currentUser.uid && !openedViewOnceMessageIds.includes(msg.id));
+                          const reactions = Object.entries(msg.reactions || {}).filter(([, ids]) => Array.isArray(ids) && ids.length > 0);
                           return (
-                            <div key={msg.id} className="groupedMessageItem">
+                            <div
+                              key={msg.id}
+                              className={`groupedMessageItem ${openReactionPickerId === msg.id ? "reactionPickerOpen" : ""}`}
+                              onClick={(event) => {
+                                if (isInteractiveMessageTarget(event.target)) return;
+                                if (editingMessageId === msg.id || isViewOnceLocked) return;
+                                toggleReactionPicker(msg.id);
+                              }}
+                              onPointerDown={(event) => {
+                                if (isInteractiveMessageTarget(event.target)) return;
+                                if (editingMessageId === msg.id || isViewOnceLocked) return;
+                                beginMessageLongPress(msg.id);
+                              }}
+                              onPointerUp={cancelMessageLongPress}
+                              onPointerLeave={cancelMessageLongPress}
+                              onPointerCancel={cancelMessageLongPress}
+                            >
+                              <div className="messageMetaBadges">
+                                {msg.viewOnce && <span className="messageBadge">One-time</span>}
+                                {msg.expiresAt && <span className="messageBadge">Timed</span>}
+                                {msg.timedOut && <span className="messageBadge timedOut">Timed out</span>}
+                              </div>
                               {msg.replyToMessageId && (
                                 <div className="replyContext">
                                   <strong>{msg.replyToSenderName || "User"}</strong>
@@ -2762,9 +4949,27 @@ export default function App() {
                                   </div>
                                 </div>
                               ) : (
-                                msg.text && <p>{renderTextWithLinks(msg.text)}</p>
+                                <>
+                                  {msg.timedOut ? (
+                                    <div className="timedOutCard">
+                                      <strong>Message timed out</strong>
+                                      <small>This timed message is no longer available.</small>
+                                    </div>
+                                  ) : isViewOnceLocked ? (
+                                    <button
+                                      type="button"
+                                      className="viewOnceCard"
+                                      onClick={() => openViewOnceMessage(msg)}
+                                    >
+                                      <strong>Open one-time message</strong>
+                                      <small>This message disappears after opening.</small>
+                                    </button>
+                                  ) : (
+                                    msg.text && <p>{renderTextWithLinks(msg.text)}</p>
+                                  )}
+                                </>
                               )}
-                              {msg.mediaURL && (
+                              {msg.mediaURL && !isViewOnceLocked && (
                                 <div className="mediaBlock">
                                   {msg.mediaType?.startsWith("image/") ? (
                                     <img
@@ -2791,6 +4996,54 @@ export default function App() {
                                   )}
                                 </div>
                               )}
+                              <div className="reactionRow">
+                                {reactions.map(([emoji, ids]) => {
+                                  const hasReacted = Array.isArray(ids) && ids.includes(currentUser.uid);
+                                  return (
+                                    <button
+                                      key={emoji}
+                                      type="button"
+                                      className={`reactionPill ${hasReacted ? "active" : ""}`}
+                                      onClick={() => toggleReaction(msg.id, emoji, hasReacted)}
+                                    >
+                                      <span>{emoji}</span>
+                                      <small>{formatReactionCount(ids)}</small>
+                                    </button>
+                                  );
+                                })}
+                                {!isViewOnceLocked && openReactionPickerId === msg.id && (
+                                  <div className="reactionTray">
+                                    {quickReactionOptions.map((emoji) => {
+                                      const hasReacted = Array.isArray(msg.reactions?.[emoji]) && msg.reactions[emoji].includes(currentUser.uid);
+                                      return (
+                                        <button
+                                          key={emoji}
+                                          type="button"
+                                          className={`reactionQuickBtn ${hasReacted ? "active" : ""}`}
+                                          onClick={(event) => {
+                                            event.stopPropagation();
+                                            toggleReaction(msg.id, emoji, hasReacted);
+                                          }}
+                                        >
+                                          {emoji}
+                                        </button>
+                                      );
+                                    })}
+                                    <button
+                                      type="button"
+                                      className="reactionAddBtn"
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        chooseCustomReactionEmoji();
+                                      }}
+                                      title="Choose quick reaction emoji"
+                                      aria-label="Choose quick reaction emoji"
+                                    >
+                                      +
+                                    </button>
+                                  </div>
+                                )}
+                              </div>
                               <div className="messageFoot">
                                 <small className="messageTime">
                                   {formatTime(msg.createdAt)}
@@ -2809,6 +5062,13 @@ export default function App() {
                                   </button>
                                   {openMessageMenuId === msg.id && (
                                     <div className="messageMenu" onClick={(event) => event.stopPropagation()}>
+                                      <button
+                                        type="button"
+                                        className="ghost menuItem"
+                                        onClick={() => toggleReactionPicker(msg.id)}
+                                      >
+                                        React
+                                      </button>
                                       <button
                                         type="button"
                                         className="ghost menuItem"
@@ -2882,6 +5142,14 @@ export default function App() {
                   </button>
                 </div>
               )}
+              {describeMessageMode() && (
+                <div className="messageModeBar">
+                  <span>{describeMessageMode()}</span>
+                  <button type="button" className="ghost" onClick={resetMessageMode}>
+                    Clear
+                  </button>
+                </div>
+              )}
 
               <form onSubmit={sendMessage} className="composer" ref={composerFormRef}>
                 <div className="attachWrap">
@@ -2901,6 +5169,45 @@ export default function App() {
                         type="button"
                         className="ghost menuItem"
                         onClick={() => {
+                          setMessageMode({ type: "viewOnce", durationMs: 0 });
+                          setTimedMenuOpen(false);
+                          setAttachMenuOpen(false);
+                        }}
+                      >
+                        One-time
+                      </button>
+                      <button
+                        type="button"
+                        className={`ghost menuItem timedParentBtn ${timedMenuOpen ? "active" : ""}`}
+                        onClick={() => setTimedMenuOpen((prev) => !prev)}
+                      >
+                        Timed
+                      </button>
+                      {timedMenuOpen && (
+                        <div className="timedMenuGroup">
+                          <div className="timedMenuOptions">
+                            {TIMED_MESSAGE_OPTIONS.map((option) => (
+                              <button
+                                key={option.value}
+                                type="button"
+                                className={`ghost timedOptionBtn ${messageMode.type === "timed" && messageMode.durationMs === option.value ? "active" : ""}`}
+                                onClick={() => {
+                                  setMessageMode({ type: "timed", durationMs: option.value });
+                                  setTimedMenuOpen(false);
+                                  setAttachMenuOpen(false);
+                                }}
+                              >
+                                {option.label}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      <button
+                        type="button"
+                        className="ghost menuItem"
+                        onClick={() => {
+                          setTimedMenuOpen(false);
                           mediaInputRef.current?.click();
                           setAttachMenuOpen(false);
                         }}
@@ -2911,6 +5218,7 @@ export default function App() {
                         type="button"
                         className="ghost menuItem"
                         onClick={() => {
+                          setTimedMenuOpen(false);
                           documentInputRef.current?.click();
                           setAttachMenuOpen(false);
                         }}
@@ -2921,6 +5229,18 @@ export default function App() {
                         type="button"
                         className="ghost menuItem"
                         onClick={() => {
+                          setTimedMenuOpen(false);
+                          openGamesPopup();
+                          setAttachMenuOpen(false);
+                        }}
+                      >
+                        Games
+                      </button>
+                      <button
+                        type="button"
+                        className="ghost menuItem"
+                        onClick={() => {
+                          setTimedMenuOpen(false);
                           openEventSchedulerPopup();
                           setAttachMenuOpen(false);
                         }}
@@ -2931,6 +5251,7 @@ export default function App() {
                         type="button"
                         className="ghost menuItem"
                         onClick={() => {
+                          setTimedMenuOpen(false);
                           sendContactCard().catch(() => {});
                           setAttachMenuOpen(false);
                         }}
@@ -2941,6 +5262,7 @@ export default function App() {
                         type="button"
                         className="ghost menuItem"
                         onClick={() => {
+                          setTimedMenuOpen(false);
                           sendCurrentLocation().catch(() => {});
                           setAttachMenuOpen(false);
                         }}
@@ -2952,6 +5274,7 @@ export default function App() {
                           type="button"
                           className="ghost menuItem"
                           onClick={() => {
+                            setTimedMenuOpen(false);
                             cameraInputRef.current?.click();
                             setAttachMenuOpen(false);
                           }}
@@ -3043,6 +5366,11 @@ export default function App() {
             <div className="emptyState">
               <h3>There is no message here.</h3>
               <p>Select or create a chat to start.</p>
+              {isMobileLayout && mainChatList.length === 0 && (
+                <button type="button" onClick={openAddFriendPopup}>
+                  Add Friend
+                </button>
+              )}
             </div>
           )}
         </section>
@@ -3149,8 +5477,10 @@ export default function App() {
         )}
         </div>
         </section>
+        </>
+        )}
 
-        {(showAddFriend || showCreateGroup || showNotifications || showProfile || showEventScheduler || showGroupProfile) && (
+        {(showAddFriend || showCreateGroup || showNotifications || showProfile || showEventScheduler || showGroupProfile || showGamesMenu) && (
           <div className="popupBackdrop" onClick={closePopups}>
           {showAddFriend && (
             <section className="popupCard" onClick={(event) => event.stopPropagation()}>
@@ -3261,43 +5591,7 @@ export default function App() {
 
           {showNotifications && (
             <section className="popupCard" onClick={(event) => event.stopPropagation()}>
-              <div className="popupHead">
-                <h3>Friend Requests</h3>
-                <button type="button" className="ghost" onClick={closePopups}>
-                  Close
-                </button>
-              </div>
-              <div className="notifyTools">
-                <p className="muted">Browser alerts: {notificationPermission}</p>
-                <p className="muted">
-                  Cloud messaging: {notificationPermission === "granted" ? "Access is granted" : fcmStatus || "not configured"}
-                </p>
-                {notificationPermission !== "granted" && (
-                  <button type="button" className="ghost" onClick={requestNotificationPermission}>
-                    Enable Push Notifications
-                  </button>
-                )}
-              </div>
-              {requests.length === 0 && <p className="muted">No pending requests.</p>}
-              <div className="requestList">
-                {requests.map((request) => (
-                  <article key={request.id} className="requestCard">
-                    <p>{request.fromUsername} sent you a request.</p>
-                    <div className="requestActions">
-                      <button type="button" onClick={() => respondToRequest(request, "accepted")}>
-                        Accept
-                      </button>
-                      <button
-                        type="button"
-                        className="ghost"
-                        onClick={() => respondToRequest(request, "declined")}
-                      >
-                        Decline
-                      </button>
-                    </div>
-                  </article>
-                ))}
-              </div>
+              {renderNotificationsContent()}
             </section>
           )}
 
@@ -3531,62 +5825,109 @@ export default function App() {
             </section>
           )}
 
-          {showProfile && (
+          {showGamesMenu && (
             <section className="popupCard" onClick={(event) => event.stopPropagation()}>
               <div className="popupHead">
-                <h3>Profile</h3>
+                <h3>Chat Games</h3>
                 <button type="button" className="ghost" onClick={closePopups}>
                   Close
                 </button>
               </div>
-              <div className="profileCard">
-                <div className="profileAvatarWrap">
-                  {userProfile?.photoURL || currentUser.photoURL ? (
-                    <img
-                      src={userProfile?.photoURL || currentUser.photoURL}
-                      alt="Profile"
-                      className="profileAvatar"
-                    />
-                  ) : (
-                    <div className="profileAvatarFallback">{initials(username)}</div>
-                  )}
-                  {isCurrentUserOnline && <span className="profileOnlineDot" aria-label="Online" />}
-                </div>
-                <p>
-                  <strong>Username:</strong> {username}{" "}
-                  <span className={`userStatusText ${isCurrentUserOnline ? "online" : "offline"}`}>
-                    {isCurrentUserOnline ? "Online" : "Offline"}
-                  </span>
-                </p>
-                <p>
-                  <strong>Email:</strong> {currentUser.email}
-                </p>
-                <p>
-                  <strong>Bio:</strong> {userProfile?.bio || "No bio yet."}
-                </p>
+              <p className="muted">
+                {canUseGamesInChat || canUseLudoInChat
+                  ? "Pick a game. Ludo also works in group chats with exactly 4 members."
+                  : "Games work in direct chats only, except Ludo which supports 4-member groups."}
+              </p>
+              <div className="gamesMenuGrid">
                 <button
                   type="button"
-                  onClick={() => {
-                    setProfileNameDraft(username);
-                    setProfileBioDraft(userProfile?.bio || "");
-                    setShowEditProfile(true);
-                  }}
+                  className="gameMenuCard"
+                  onClick={() => startChatGame(GAME_TYPES.tictactoe)}
+                  disabled={!canUseGamesInChat || activeGame || hasPendingGameInvite}
                 >
-                  Edit Profile
+                  <span className="gameMenuBadge">Board</span>
+                  <strong>Tic-Tac-Toe</strong>
+                  <small>Turn-based board game with persistent state in the chat.</small>
                 </button>
-                <button type="button" className="ghost" onClick={() => setShowSavedContent(true)}>
-                  Saved Content
+                <button
+                  type="button"
+                  className="gameMenuCard"
+                  onClick={() => startChatGame(GAME_TYPES.rps)}
+                  disabled={!canUseGamesInChat || activeGame || hasPendingGameInvite}
+                >
+                  <span className="gameMenuBadge">Quick</span>
+                  <strong>Rock Paper Scissors</strong>
+                  <small>Both players choose privately, then the result resolves in-chat.</small>
                 </button>
-                {profileStatus && <small className="muted">{profileStatus}</small>}
-                <button type="button" className="ghost" onClick={() => signOut(auth)}>
-                  Logout
+                <button
+                  type="button"
+                  className="gameMenuCard"
+                  onClick={() => startChatGame(GAME_TYPES.ludo)}
+                  disabled={!canUseLudoInChat || activeGame || hasPendingGameInvite}
+                >
+                  <span className="gameMenuBadge">Race</span>
+                  <strong>Ludo</strong>
+                  <small>Two tokens each, dice rolls, captures, and now up to 4 players in group chats.</small>
                 </button>
               </div>
+              {activeGame && (
+                <p className="muted">
+                  Active session: <strong>{formatGameTypeLabel(activeGame.type)}</strong> ({activeGame.status})
+                </p>
+              )}
+              {!activeGame && hasPendingGameInvite && <p className="muted">A game invite is already pending in this chat.</p>}
+              {gameStatus && <p className="muted">{gameStatus}</p>}
+            </section>
+          )}
+
+          {showProfile && (
+            <section className="popupCard" onClick={(event) => event.stopPropagation()}>
+              {renderProfileContent()}
             </section>
           )}
           </div>
         )}
       </main>
+      {isMobileLayout && isTrueMobileDevice && mobileScreen !== "chat" && (
+        <nav className="mobileBottomNav">
+          <button
+            type="button"
+            className={`ghost mobileBottomNavBtn ${mobileNavSection === "messages" ? "active" : ""}`}
+            onClick={() => {
+              setMobileNavSection("messages");
+              setMobileScreen("list");
+            }}
+            aria-label="Messages"
+          >
+            {renderNavIcon("messages")}
+            <span className="navTextLabel">Messages</span>
+          </button>
+          <button
+            type="button"
+            className={`ghost mobileBottomNavBtn ${mobileNavSection === "notifications" ? "active" : ""}`}
+            onClick={() => {
+              closePopups();
+              setMobileNavSection("notifications");
+            }}
+            aria-label="Notifications"
+          >
+            {renderNavIcon("notifications")}
+            <span className="navTextLabel">Notifications</span>
+          </button>
+          <button
+            type="button"
+            className={`ghost mobileBottomNavBtn ${mobileNavSection === "profile" ? "active" : ""}`}
+            onClick={() => {
+              closePopups();
+              setMobileNavSection("profile");
+            }}
+            aria-label="Profile"
+          >
+            {renderNavIcon("profile")}
+            <span className="navTextLabel">You</span>
+          </button>
+        </nav>
+      )}
 
       {previewImage && (
         <div className="imageOverlay" onClick={() => setPreviewImage("")}>
@@ -3624,6 +5965,71 @@ export default function App() {
                 style={{ transform: `scale(${previewZoom})` }}
               />
             </div>
+          </div>
+        </div>
+      )}
+
+      {showGameOverlay && activeGame && (
+        <div className="gameOverlay" onClick={closeGameOverlay}>
+          <div className="gameOverlayShell" onClick={(event) => event.stopPropagation()}>
+            <div className="gameOverlayHead">
+              <div>
+                <strong>{formatGameTypeLabel(activeGame.type)}</strong>
+                <small>{selectedChat?.isGroup ? selectedChat.groupName || "Group" : selectedChatOtherUser?.username || "Chat"}</small>
+              </div>
+              <button type="button" className="ghost" onClick={closeGameOverlay}>
+                Close
+              </button>
+            </div>
+            <div className="gameOverlayBody">
+              {renderActiveGameCard()}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {viewOnceOverlay && (
+        <div
+          className="viewOnceOverlay"
+          onClick={() => closeViewOnceOverlay().catch(() => {})}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <div className="viewOnceOverlayCard" onClick={(event) => event.stopPropagation()}>
+            <div className="viewOnceOverlayHead">
+              <div>
+                <strong>One-time message</strong>
+                <small>{viewOnceOverlay.senderName}</small>
+              </div>
+              <button type="button" className="ghost" onClick={() => closeViewOnceOverlay().catch(() => {})}>
+                Close
+              </button>
+            </div>
+            <div className="viewOnceShield">Private view</div>
+            {viewOnceOverlay.text && <p className="viewOnceOverlayText">{renderTextWithLinks(viewOnceOverlay.text)}</p>}
+            {viewOnceOverlay.mediaURL && (
+              <div className="viewOnceOverlayMedia">
+                {viewOnceOverlay.mediaType?.startsWith("image/") ? (
+                  <img
+                    src={viewOnceOverlay.mediaURL}
+                    alt={viewOnceOverlay.mediaName || "One-time media"}
+                    className="viewOnceOverlayImage"
+                    draggable="false"
+                  />
+                ) : viewOnceOverlay.mediaType?.startsWith("video/") ? (
+                  <video controls className="viewOnceOverlayVideo">
+                    <source src={viewOnceOverlay.mediaURL} type={viewOnceOverlay.mediaType} />
+                  </video>
+                ) : viewOnceOverlay.mediaType?.startsWith("audio/") ? (
+                  <audio controls className="msgAudio">
+                    <source src={viewOnceOverlay.mediaURL} type={viewOnceOverlay.mediaType} />
+                  </audio>
+                ) : (
+                  <a href={viewOnceOverlay.mediaURL} target="_blank" rel="noreferrer" className="fileLink">
+                    {viewOnceOverlay.mediaName || "Open file"}
+                  </a>
+                )}
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -3826,6 +6232,13 @@ export default function App() {
         <div className="eventToast">
           <strong>Event Time</strong>
           <p>{eventToast.text}</p>
+        </div>
+      )}
+
+      {gameToast && (
+        <div className="eventToast gameToast">
+          <strong>Games</strong>
+          <p>{gameToast}</p>
         </div>
       )}
 

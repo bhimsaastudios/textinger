@@ -5,6 +5,7 @@ Realtime Firebase chat app with:
 - Direct chats and groups/subgroups
 - Media sending (Cloudinary)
 - Firebase notifications for open app + OneSignal for closed/background app
+- Capacitor Android shell for native mobile app builds
 
 ## Setup
 
@@ -36,6 +37,30 @@ VITE_ONESIGNAL_NOTIFY_URL=
 ```bash
 npm run dev
 ```
+
+## Web + Capacitor
+
+This project now keeps both:
+- `Web app`: Vite build deployed to Firebase Hosting
+- `Mobile app`: Capacitor Android shell using the same `dist` build
+
+Useful commands:
+
+```bash
+npm run build
+npm run cap:sync
+npm run cap:android
+npm run cap:open:android
+```
+
+What they do:
+- `cap:sync`: builds web and syncs assets/plugins into native platforms
+- `cap:android`: builds web and syncs Android specifically
+- `cap:open:android`: opens the Android project in Android Studio
+
+Files added for this:
+- `capacitor.config.json`
+- `android/`
 
 ## Cloud Messaging: Why
 
@@ -95,6 +120,30 @@ This project includes:
 - `public/firebase-messaging-sw.js` for background push handling
 - `public/manifest.webmanifest` for installable mobile web app behavior
 - Cloud Function trigger at `chats/{chatId}/messages/{messageId}` to send push to `users/{uid}.fcmTokens`
+
+## Native Android Push With Capacitor
+
+If you want reliable background notifications on mobile, use the Capacitor Android app instead of depending only on the PWA.
+
+Current state:
+- Capacitor packages are installed
+- Android project is created in `android/`
+- The web app setup is kept unchanged
+- Native Android push registration is wired in the app
+- Native tokens are stored in Firestore on login/permission grant
+
+What you still need for native push:
+1. Add Firebase Android app in Firebase Console
+2. Download `google-services.json`
+3. Place it in `android/app/google-services.json`
+4. Open Android Studio and build/run the app once
+5. Add a backend sender for native FCM notifications
+
+Important:
+- PWA notifications and native Android push are different delivery paths
+- Capacitor is the correct path for dependable background notifications
+- The current repository now supports both paths side by side
+- Token registration alone does not send notifications; a server/backend must send to those tokens
 
 ## Free Closed-App Push (No Blaze): OneSignal + Cloudflare Worker
 
